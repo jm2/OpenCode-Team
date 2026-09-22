@@ -477,10 +477,15 @@ async function cmdInstall(args: string[]): Promise<void> {
   const autoYes = yesFlag(args);
   const isTTY = process.stdout.isTTY;
 
-  // Resolve the package spec. We use the npm package name so users
-  // can pin to a version. The plugin's exports field provides
-  // the entry points.
-  const pkg = "opencode-teamwork@latest";
+  // Resolve the package spec: the plugin version that matches this CLI.
+  //
+  // It used to be "@latest", which decouples the two. When the CLI is newer
+  // than what npm tags as latest — as with this 0.3.0 CLI while npm's only
+  // published version is 0.2.1 — the installer wires in an older plugin
+  // with no warning, and the user runs code that predates everything the
+  // CLI and README describe. Pinning makes a missing release fail loudly
+  // at load time instead of silently running the wrong version.
+  const pkg = await pluginSpec();
 
   // ── 1. Choose the model assignment ────────────────────────────────
   // `--all-seats <id>` and the alias presets short-circuit everything else:
@@ -783,6 +788,16 @@ async function main(): Promise<void> {
   console.error(`Unknown command: ${cmd}`);
   printHelp();
   process.exit(1);
+}
+
+/** `opencode-teamwork@<this CLI's version>`, or @latest if it cannot be read. */
+async function pluginSpec(): Promise<string> {
+  const version = await readPackageVersion();
+  if (version === "0.0.0") {
+    console.warn(`  ! could not read this CLI's version; falling back to opencode-teamwork@latest`);
+    return "opencode-teamwork@latest";
+  }
+  return `opencode-teamwork@${version}`;
 }
 
 async function readPackageVersion(): Promise<string> {

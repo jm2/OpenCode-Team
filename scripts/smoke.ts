@@ -44,7 +44,8 @@ if (!existsSync(cfgPath)) fail(`Config not written: ${cfgPath}`);
 ok(`Config written: ${cfgPath}`);
 
 const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
-if (!Array.isArray(cfg.plugin) || !cfg.plugin.includes("opencode-teamwork@latest"))
+const isTeamwork = (p: unknown) => typeof p === "string" && p.startsWith("opencode-teamwork@");
+if (!Array.isArray(cfg.plugin) || !cfg.plugin.some(isTeamwork))
   fail("plugin entry missing");
 ok("plugin entry present");
 
@@ -98,7 +99,7 @@ console.log("\n[3] Uninstall (--yes)");
   if (!r.stdout.includes("Changes that will be made")) fail("No diff preview in uninstall log");
   ok("Diff preview shown");
   const after = JSON.parse(readFileSync(cfgPath, "utf-8"));
-  if (Array.isArray(after.plugin) && after.plugin.includes("opencode-teamwork@latest"))
+  if (Array.isArray(after.plugin) && after.plugin.some(isTeamwork))
     fail("Plugin still listed after uninstall");
   ok("Plugin removed from plugin list");
   for (const role of expectedRoles) {
