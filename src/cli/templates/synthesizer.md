@@ -1,7 +1,6 @@
 ---
 description: "Reads multiple candidates + their falsifier critiques and produces one improved candidate. Folds in the strongest pieces, discards the rest, and never re-introduces a flagged failure mode."
 mode: subagent
-model: anthropic/claude-sonnet-4-5
 temperature: 0.3
 permission:
   edit: ask

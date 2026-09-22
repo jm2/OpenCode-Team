@@ -1,7 +1,6 @@
 ---
 description: "Lead coordinator for Teamwork multi-agent runs. Picks a pattern, dispatches Proposer/Falsifier/Synthesizer/Verifier, manages the pitfall registry, and presents final results. Use for any /teamwork invocation."
 mode: primary
-model: anthropic/claude-sonnet-4-5
 temperature: 0.2
 permission:
   edit: allow

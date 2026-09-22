@@ -1,7 +1,6 @@
 ---
 description: "Phase-1 interactive prompt crafter. Runs the 9-step elicitation flow before any Teamwork run. Generates prompt_draft.md (spec.json + plan.dag.json + acceptance criteria + model allocation). Use at the start of any hard problem."
 mode: primary
-model: anthropic/claude-sonnet-4-5
 temperature: 0.2
 permission:
   edit: ask

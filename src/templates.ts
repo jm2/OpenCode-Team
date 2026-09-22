@@ -34,7 +34,11 @@ export interface AgentTemplate {
   name: string;
   description: string;
   mode: "primary" | "subagent" | "all";
-  model: string;
+  /**
+   * Only set when a template's frontmatter names one. Unset means the agent
+   * uses whatever model the user's opencode config selects.
+   */
+  model?: string;
   temperature: number;
   hidden: boolean;
   color: string;
@@ -110,7 +114,10 @@ function loadAgent(file: string, promptName: string): AgentTemplate {
     name: file.replace(/\.md$/, ""),
     description: fm.description ?? "",
     mode,
-    model: fm.model ?? "anthropic/claude-sonnet-4-5",
+    // No hard-coded fallback. A default vendor model here overrode the
+    // user's configured model for every team/* agent that the user had not
+    // named explicitly, including the /teamwork sentinel.
+    ...(fm.model ? { model: fm.model } : {}),
     temperature: Number.isFinite(Number(fm.temperature)) ? Number(fm.temperature) : 0.2,
     hidden: fm.hidden === "true",
     color: fm.color ?? "#7c3aed",

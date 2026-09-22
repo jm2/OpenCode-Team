@@ -1,7 +1,6 @@
 ---
 description: "Worker — specialized implementation agent. Receives a scoped spec.json + its own git worktree, edits code there, returns a patch.diff + summary.md. Hides itself in the agent menu; only the Sentinel invokes."
 mode: subagent
-model: anthropic/claude-sonnet-4-5
 temperature: 0.3
 permission:
   edit: allow
