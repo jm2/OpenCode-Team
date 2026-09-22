@@ -344,6 +344,9 @@ export class Engine {
     this.tasks = opts.tasks;
     this.policy = opts.policy ?? DEFAULT_POLICY;
     const topo = getTopology(opts.topology);
+    // Explicit --budget, then a project-wide cap from policy.json, then the
+    // topology's own default. A massive-proof-swarm and a small-focused fix
+    // should not share one ceiling unless someone asked them to.
     this.budgetUsd =
       opts.budgetUsd ?? this.policy.budget.perSessionUsd ?? topo?.defaultMaxCostUsd ?? 20;
     this.maxConcurrency = opts.maxConcurrency ?? topo?.defaultConcurrency ?? 2;
