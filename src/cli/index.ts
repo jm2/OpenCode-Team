@@ -338,6 +338,7 @@ function buildPatch(agents: Record<string, string>, pkg: string): Record<string,
 
 function deepMerge(target: Record<string, any>, patch: Record<string, any>): Record<string, any> {
   for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
     if (v && typeof v === "object" && !Array.isArray(v) && target[k] && typeof target[k] === "object") {
       target[k] = deepMerge({ ...(target[k] as Record<string, any>) }, v as Record<string, any>);
     } else {
@@ -351,6 +352,26 @@ function ensurePluginListed(config: Record<string, any>, pkg: string): void {
   config.plugin = config.plugin ?? [];
   if (!Array.isArray(config.plugin)) config.plugin = [config.plugin];
   if (!config.plugin.includes(pkg)) config.plugin.push(pkg);
+}
+
+/**
+ * True for an npm spec naming this package: "opencode-teamwork" or
+ * "opencode-teamwork@<anything>". A bare prefix test would also match an
+ * unrelated "opencode-teamwork-foo".
+ */
+export function isTeamworkPluginSpec(spec: unknown): boolean {
+  return typeof spec === "string" && (spec === "opencode-teamwork" || spec.startsWith("opencode-teamwork@"));
+}
+
+/**
+ * The user's plugin list with this package set to exactly `pkg`.
+ *
+ * Every other plugin is kept, in order. Earlier specs of this package are
+ * dropped, so an upgrade from @0.2.1 to @latest does not load two copies.
+ */
+export function withTeamworkPlugin(existing: unknown, pkg: string): string[] {
+  const list = Array.isArray(existing) ? existing : existing === undefined ? [] : [existing];
+  return [...list.filter((p) => !isTeamworkPluginSpec(p)), pkg];
 }
 
 // ─── Commands ────────────────────────────────────────────────────────
@@ -425,7 +446,15 @@ async function cmdInstall(args: string[]): Promise<void> {
   }
 
   const existing = reset ? {} : loadExistingConfig(configPath);
-  const merged = reset ? patch : deepMerge(existing, patch);
+  // deepMerge mutates its target, so merge into a copy. Merging into
+  // `existing` made the preview below diff the merged config against
+  // itself, and it printed "(no changes)" for every install.
+  const merged = reset
+    ? { ...patch }
+    : deepMerge(structuredClone(existing), { ...patch, plugin: undefined });
+  // Arrays are replaced wholesale by deepMerge, which used to overwrite the
+  // user's whole plugin list with this one package.
+  merged.plugin = reset ? [pkg] : withTeamworkPlugin(existing.plugin, pkg);
   ensurePluginListed(merged, pkg);
 
   // If a config already exists and we're not --reset, show the diff
@@ -491,16 +520,18 @@ async function cmdUninstall(args: string[]): Promise<void> {
     return;
   }
 
-  // Preview what will be removed
+  // Preview what will be removed. Start from a copy of the WHOLE config:
+  // this used to start from an empty object and copy back only `plugin` and
+  // `agent`, so uninstalling deleted every other key — providers, MCP
+  // servers, the default model, $schema.
   const config = loadExistingConfig(configPath);
-  const preview: Record<string, any> = {};
+  const preview: Record<string, any> = structuredClone(config);
   if (Array.isArray(config.plugin)) {
-    preview.plugin = (config.plugin as string[]).filter(
-      (p: string) => !p.startsWith("opencode-teamwork"),
-    );
+    preview.plugin = (config.plugin as unknown[]).filter((p) => !isTeamworkPluginSpec(p));
+  } else if (isTeamworkPluginSpec(config.plugin)) {
+    delete preview.plugin;
   }
   if (config.agent && typeof config.agent === "object") {
-    preview.agent = { ...config.agent };
     for (const role of ROLES) {
       delete (preview.agent as Record<string, any>)[role];
     }
@@ -546,9 +577,7 @@ async function cmdDoctor(_args: string[]): Promise<void> {
     process.exit(1);
   }
   const config = loadExistingConfig(configPath);
-  const hasPlugin =
-    Array.isArray(config.plugin) &&
-    config.plugin.some((p: string) => p.startsWith("opencode-teamwork"));
+  const hasPlugin = Array.isArray(config.plugin) && config.plugin.some(isTeamworkPluginSpec);
   const agents = config.agent ?? {};
   const allRoles = ROLES.every((r) => r in agents);
   console.log(`  Plugin listed:  ${hasPlugin ? "✓" : "✗"}`);
