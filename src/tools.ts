@@ -43,24 +43,44 @@ export function mintSessionId(now = new Date()): string {
   return `${stamp}-${rand}`;
 }
 
-export function loadPolicy(projectDir: string): Policy {
+export interface PolicyLoad {
+  policy: Policy;
+  /** Set when a policy file exists but could not be read. */
+  error?: string;
+  path: string;
+}
+
+/**
+ * Load `.teamwork/policy.json`, reporting a file that exists but will not
+ * parse.
+ *
+ * The fallback to DEFAULT_POLICY used to be silent. A trailing comma in the
+ * policy file quietly discarded everything the file said: its model ladders,
+ * its budget, and any `requiredChecks` it added to a task class. The checks
+ * that ship in DEFAULT_POLICY survive the fallback; the ones the project
+ * declared for itself do not. A verification requirement disappearing
+ * because of a typo should not be quiet.
+ */
+export function loadPolicyResult(projectDir: string): PolicyLoad {
+  // The single-model pin is applied last, so it holds whichever way the
+  // file resolved.
   const path = join(projectDir, ".teamwork", "policy.json");
-  let policy: Policy = DEFAULT_POLICY;
-  if (existsSync(path)) {
-    try {
-      const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<Policy>;
-      policy = {
+  if (!existsSync(path)) return { policy: applySingleModelPin(DEFAULT_POLICY), path };
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<Policy>;
+    return {
+      path,
+      policy: applySingleModelPin({
         ...DEFAULT_POLICY,
         ...raw,
         budget: { ...DEFAULT_POLICY.budget, ...(raw.budget ?? {}) },
         routing: { ...DEFAULT_POLICY.routing, ...(raw.routing ?? {}) },
         promptFragments: { ...DEFAULT_POLICY.promptFragments, ...(raw.promptFragments ?? {}) },
-      };
-    } catch {
-      policy = DEFAULT_POLICY;
-    }
+      }),
+    };
+  } catch (err) {
+    return { policy: applySingleModelPin(DEFAULT_POLICY), path, error: (err as Error).message };
   }
-  return applySingleModelPin(policy);
 }
 
 /**
@@ -79,6 +99,10 @@ export function applySingleModelPin(policy: Policy): Policy {
   const pinned = process.env[ALL_SEATS_ENV]?.trim();
   if (!pinned) return policy;
   return { ...policy, routing: singleModelRouting(pinned, policy.routing) };
+}
+
+export function loadPolicy(projectDir: string): Policy {
+  return loadPolicyResult(projectDir).policy;
 }
 
 function openRun(projectDir: string, sessionId: string): Engine {
@@ -181,7 +205,8 @@ export const teamworkPlan: ToolDefinition = tool({
 
     const sessionId = args.sessionId ?? mintSessionId();
     const runDir = runDirFor(context.directory, sessionId);
-    const policy = loadPolicy(context.directory);
+    const policyLoad = loadPolicyResult(context.directory);
+    const policy = policyLoad.policy;
 
     const tasks: DagTask[] = args.tasks.map((t) => ({
       taskId: t.taskId,
@@ -293,6 +318,11 @@ export const teamworkPlan: ToolDefinition = tool({
     });
 
     return [
+      policyLoad.error
+        ? `WARNING: ${policyLoad.path} exists but is not valid JSON (${policyLoad.error}).\n` +
+          `  The run is using the DEFAULT policy — your model ladders and any requiredChecks\n` +
+          `  declared in that file are NOT in effect. Fix the file and re-plan.\n`
+        : "",
       `run created: ${sessionId}`,
       `run dir: ${runDir}`,
       `topology: ${args.topology} | concurrency cap: ${engine.maxConcurrency} | ${
