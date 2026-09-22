@@ -9,9 +9,9 @@
 
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { join } from "node:path";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
   allSeatsAgents,
   findAlias,
@@ -25,6 +25,24 @@ import {
 import { DEFAULT_POLICY } from "../src/policy.ts";
 
 const MIMO = "xiaomi/mimo-v2.6-pro";
+
+const ROOT = join(import.meta.dir, "..");
+const CLI = join(ROOT, "src", "cli", "index.ts");
+
+/**
+ * Drive the installer from source.
+ *
+ * Not from `dist/`: both CI and the `verify` script run `bun test` before
+ * `bun run build`, so a dist-based test fails outright on a fresh clone and,
+ * worse, passes against a stale artifact on a dirty one.
+ */
+function cli(args: string[]): string {
+  return execFileSync(process.execPath, [CLI, ...args], {
+    cwd: ROOT,
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
 
 /** A config shaped like a real opencode provider block. */
 function mimoConfig(npm = "@ai-sdk/openai-compatible"): Record<string, any> {
@@ -114,11 +132,7 @@ describe("the emitted patch is vendor-free (the Phase 1 guarantee)", () => {
 
   test("`install --print --all-seats <id>` emits no vendor model string", () => {
     // Drive the real CLI, so this covers buildPatch and the plugin entry too.
-    const out = execFileSync(
-      "node",
-      ["dist/cli/index.js", "install", "--print", "--all-seats", MIMO],
-      { cwd: import.meta.dir + "/..", encoding: "utf-8" },
-    );
+    const out = cli(["install", "--print", "--all-seats", MIMO]);
 
     const json = out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1);
     const patch = JSON.parse(json);
@@ -137,11 +151,7 @@ describe("the emitted patch is vendor-free (the Phase 1 guarantee)", () => {
   });
 
   test("an upstream preset still fails the same check (the test can fail)", () => {
-    const out = execFileSync(
-      "node",
-      ["dist/cli/index.js", "install", "--print", "--preset", "anthropic"],
-      { cwd: import.meta.dir + "/..", encoding: "utf-8" },
-    );
+    const out = cli(["install", "--print", "--preset", "anthropic"]);
     const json = out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1);
     expect(findVendorModelStrings(JSON.parse(json), MIMO).length).toBe(10);
   });
