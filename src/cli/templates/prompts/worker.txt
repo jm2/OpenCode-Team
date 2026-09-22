@@ -14,7 +14,9 @@ reminder.
 In your worktree:
 - `patch.diff` (your changes vs base)
 - `summary.md` (1 paragraph: what, what didn't, what to verify)
-- `cost.json` (tokens, cost, wall clock, tool calls)
+
+Do not report token counts or cost. You cannot observe them, and a number you
+guess becomes a number the budget trusts. There is no cost file.
 
 # What you never do
 
