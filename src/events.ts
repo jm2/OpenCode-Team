@@ -27,6 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 
 export const GENESIS_HASH = "0".repeat(64);
 
@@ -174,8 +175,34 @@ export interface AppendInput {
  * serialized by the caller (the Engine does this — it is single-writer
  * per run, which is also why only one process may own a run directory).
  */
+/**
+ * Refuse to append after a partial line.
+ *
+ * Appending to a file that does not end in a newline glues the new event onto
+ * the fragment, so one damaged line becomes a damaged line that also swallows
+ * the next event. Checked from the file's last byte rather than the cached
+ * tip, because a cached tip does not know the file was cut short.
+ */
+function assertAppendable(runDir: string): void {
+  const path = eventLogPath(runDir);
+  if (!existsSync(path)) return;
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return;
+    const last = Buffer.alloc(1);
+    readSync(fd, last, 0, 1, size - 1);
+    if (last.toString("utf-8") === "\n") return;
+  } finally {
+    closeSync(fd);
+  }
+  const damage = describeLogDamage(readEventLog(runDir)) ?? "the file does not end with a newline";
+  throw new Error(`refusing to append to ${path}: ${damage}`);
+}
+
 export function appendEvent(runDir: string, input: AppendInput): RunEvent {
   mkdirSync(runDir, { recursive: true });
+  assertAppendable(runDir);
   const tip = readTip(runDir);
   const prevHash = tip?.hash ?? GENESIS_HASH;
   const seq = (tip?.seq ?? 0) + 1;
@@ -198,13 +225,70 @@ export function appendEvent(runDir: string, input: AppendInput): RunEvent {
   return event;
 }
 
-export function readEvents(runDir: string): RunEvent[] {
+export interface LogReadResult {
+  /** Every event up to the first unparseable line. */
+  events: RunEvent[];
+  /** 1-based line number of the first unparseable line, if there is one. */
+  malformedAtLine?: number;
+  malformedReason?: string;
+  /**
+   * True when the bad line is the last line in the file: the signature of a
+   * process killed mid-append. False means intact lines follow it, which a
+   * crash cannot produce.
+   */
+  malformedIsLast?: boolean;
+}
+
+/** One sentence describing the damage, shared by every caller that reports it. */
+export function describeLogDamage(log: LogReadResult): string | null {
+  if (log.malformedAtLine === undefined) return null;
+  const where = `line ${log.malformedAtLine} of events.jsonl is not valid JSON (${log.malformedReason})`;
+  const intact = `${log.events.length} event(s) before it are intact`;
+  return log.malformedIsLast
+    ? `${where}. It is the last line, which is what a run killed mid-append leaves behind; ${intact}.`
+    : `${where}, and valid lines follow it. A crash cannot produce that; the file was edited or damaged. ${intact}.`;
+}
+
+/**
+ * Read the log, stopping at the first line that will not parse.
+ *
+ * A run that is killed mid-append, or that runs out of disk, leaves a partial
+ * final line. Parsing the whole file eagerly turned that into a thrown
+ * SyntaxError from every caller — including `teamwork_resume`, whose entire
+ * job is to detect and report a damaged log. The tool could not read far
+ * enough to say what was wrong.
+ *
+ * Truncation is reported rather than skipped: silently dropping a bad line
+ * would let a damaged log look healthy, which is the failure this log format
+ * exists to prevent.
+ */
+export function readEventLog(runDir: string): LogReadResult {
   const path = eventLogPath(runDir);
-  if (!existsSync(path)) return [];
-  return readFileSync(path, "utf-8")
-    .split("\n")
-    .filter((l) => l.trim().length > 0)
-    .map((l) => JSON.parse(l) as RunEvent);
+  if (!existsSync(path)) return { events: [] };
+
+  const events: RunEvent[] = [];
+  const lines = readFileSync(path, "utf-8").split("\n");
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!;
+    if (line.trim().length === 0) continue;
+    try {
+      events.push(JSON.parse(line) as RunEvent);
+    } catch (err) {
+      const rest = lines.slice(i + 1).some((l) => l.trim().length > 0);
+      return {
+        events,
+        malformedAtLine: i + 1,
+        malformedReason: (err as Error).message,
+        malformedIsLast: !rest,
+      };
+    }
+  }
+  return { events };
+}
+
+export function readEvents(runDir: string): RunEvent[] {
+  return readEventLog(runDir).events;
 }
 
 export interface ChainCheck {

@@ -23,6 +23,8 @@ import { join } from "node:path";
 import {
   appendEvent,
   deriveSession,
+  describeLogDamage,
+  readEventLog,
   readEvents,
   verifyChain,
   writeSnapshot,
@@ -437,7 +439,12 @@ export class Engine {
 
   /** Rehydrate from the event log. Throws if the log is missing/corrupt. */
   static resume(runDir: string, opts?: { policy?: Policy }): Engine {
-    const events = readEvents(runDir);
+    const log = readEventLog(runDir);
+    const events = log.events;
+    const damage = describeLogDamage(log);
+    if (damage) {
+      throw new Error(`cannot resume from ${join(runDir, "events.jsonl")}: ${damage} Inspect the file before continuing.`);
+    }
     if (events.length === 0) throw new Error(`no events in ${runDir}`);
     const chain = verifyChain(events);
     if (!chain.ok) {
@@ -447,9 +454,20 @@ export class Engine {
     const planPath = join(runDir, "plan.dag.json");
     let tasks: DagTask[] = [];
     if (existsSync(planPath)) {
-      const plan = JSON.parse(readFileSync(planPath, "utf-8")) as {
-        tasks?: Array<Record<string, unknown>>;
-      };
+      let plan: { tasks?: Array<Record<string, unknown>> };
+      try {
+        plan = JSON.parse(readFileSync(planPath, "utf-8")) as {
+          tasks?: Array<Record<string, unknown>>;
+        };
+      } catch (err) {
+        // Falling through with no tasks would resume into a run that
+        // dispatches nothing and reports no reason.
+        throw new Error(
+          `cannot resume ${derived.sessionId}: ${planPath} is not valid JSON ` +
+            `(${(err as Error).message}). The event log is intact; restore or ` +
+            `regenerate the plan file.`,
+        );
+      }
       tasks = (plan.tasks ?? []).map((t) => ({
         taskId: String(t.taskId),
         title: String(t.title ?? t.taskId),
