@@ -34,6 +34,7 @@ import { DEFAULT_POLICY, TOPOLOGY_NAMES, type Policy } from "./policy.js";
 import { pointerFor, type RunPointer } from "./run-pointer.js";
 import { createWorktreeManager, runDirFor } from "./worktree.js";
 import { ALL_SEATS_ENV, singleModelRouting } from "./single-model.js";
+import { INTERNAL_AGENTS, readUsage, seatLeaks, summarize } from "./telemetry.js";
 import { repairArtifact, VERIFICATION_REPORT_HINT } from "./repair.js";
 
 // ─── Shared helpers ──────────────────────────────────────────────────
@@ -128,13 +129,51 @@ function statusLine(engine: Engine): string {
   const parts = Object.entries(counts)
     .map(([k, v]) => `${v} ${k.toLowerCase()}`)
     .join(", ");
-  // The cost figure is the sum of `costUsd` values the orchestrating model
-  // supplied — not metered tokens, not provider-reported usage. Labelled as
-  // an estimate so nobody reads it as a bill. See docs/GROUND-TRUTH.md §3.
+  // Say where the figure came from. Metered is opencode's own record of this
+  // run's sessions; reported is what the sentinel typed into teamwork_verify
+  // and is only used when nothing has been metered. See GROUND-TRUTH.md §11.
   const cap = engine.budgetEnforced
     ? `/$${s.budgetUsd.toFixed(2)} (${s.pctOfBudget.toFixed(0)}%)`
     : ` (no cap — budget enforcement disabled)`;
-  return `state=${s.state} tasks: ${parts || "none"} | rounds=${s.rounds} | est. cost~$${s.costUsd.toFixed(2)}${cap} [self-reported, not metered] | log=${s.chain.length} events, chain ${s.chain.ok ? "ok" : "BROKEN"}`;
+  const source =
+    s.costSource === "metered"
+      ? "[metered by opencode]"
+      : "[self-reported by the sentinel: nothing metered for this run]";
+  return `state=${s.state} tasks: ${parts || "none"} | rounds=${s.rounds} | cost $${s.costUsd.toFixed(2)}${cap} ${source} | log=${s.chain.length} events, chain ${s.chain.ok ? "ok" : "BROKEN"}`;
+}
+
+/**
+ * What the usage observer recorded for this run: the evidence that every seat
+ * ran on one model, whether reasoning was uniform, and any provider errors.
+ */
+export function usageReport(runDir: string, pinned = process.env[ALL_SEATS_ENV]?.trim()): string[] {
+  const records = readUsage(runDir);
+  if (records.length === 0) return ["usage: nothing metered for this run yet"];
+  const u = summarize(records);
+  const lines = [
+    `usage: ${u.messages} model calls (${u.subagentMessages} from subagents) | ${u.tokens.input} in / ${u.tokens.output} out / ${u.tokens.reasoning} reasoning tokens | $${u.costUsd.toFixed(4)}`,
+    `  models: ${Object.entries(u.byModel).map(([m, v]) => `${m} x${v.messages}`).join(", ")}`,
+  ];
+  if (pinned) {
+    const leaks = seatLeaks(u, pinned);
+    lines.push(
+      leaks.length === 0
+        ? `  seats: every seat ran on ${pinned}`
+        : `  SEAT LEAK: ${leaks.map((l) => `${l.agent} ran on ${l.model}`).join("; ")} (pinned: ${pinned})`,
+    );
+  }
+  const seats = Object.entries(u.byAgent).filter(([a]) => !INTERNAL_AGENTS.includes(a));
+  if (seats.length > 0) {
+    lines.push(
+      `  reasoning by seat: ${seats.map(([a, v]) => `${a} ${v.withReasoning}/${v.messages}`).join(", ")}`,
+    );
+  }
+  for (const e of u.errors) {
+    lines.push(
+      `  PROVIDER ERROR${e.subagent ? " in a subagent" : ""}: ${e.agent} on ${e.model} — ${e.name}${e.statusCode ? ` ${e.statusCode}` : ""}${e.message ? `: ${e.message}` : ""}`,
+    );
+  }
+  return lines;
 }
 
 function nextActions(engine: Engine): string {
@@ -169,9 +208,10 @@ const tool_schemaBool = () =>
     .boolean()
     .optional()
     .describe(
-      "default true. The budget sums costUsd values YOU supply to teamwork_verify — " +
-        "it is not metered tokens and not provider-reported usage, so on a subscription " +
-        "plan it corresponds to nothing billed. false disables the cap entirely.",
+      "default true. The budget is enforced against opencode's metered cost for this run " +
+        "(provider-reported tokens at catalog prices), falling back to the costUsd values " +
+        "passed to teamwork_verify only when nothing is metered. On a subscription plan the " +
+        "dollar figure is notional. false disables the cap entirely.",
     );
 
 interface PlanFlags {
@@ -387,7 +427,7 @@ export const teamworkPlan: ToolDefinition = tool({
       `run dir: ${runDir}`,
       `topology: ${args.topology} | concurrency cap: ${engine.maxConcurrency} | ${
         engine.budgetEnforced
-          ? `budget: $${engine.budgetUsd.toFixed(2)} — warns at ${engine.haltAtPct}%, refuses dispatch at 100%. This sums the costUsd values you report to teamwork_verify; it is an estimate, not metered usage.`
+          ? `budget: $${engine.budgetUsd.toFixed(2)} — warns at ${engine.haltAtPct}%, refuses dispatch at 100%. Enforced against opencode's metered cost for this run; do not estimate costUsd for teamwork_verify.`
           : `budget: DISABLED (--no-budget) — no cap gates dispatch`
       }`,
       `waves: ${waves.map((w, i) => `[${i + 1}] ${w.join(" + ")}`).join("  ")}`,
@@ -648,6 +688,8 @@ export const teamworkStatus: ToolDefinition = tool({
       statusLine(engine),
       `session: ${s.sessionId} | topology: ${s.topology ?? "?"} | chain ${s.chain.ok ? "verified" : `BROKEN (${s.chain.reason})`}`,
       ...rows,
+      "",
+      ...usageReport(runDir),
       "",
       nextActions(engine),
     ].join("\n");

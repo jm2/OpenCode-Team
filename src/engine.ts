@@ -31,6 +31,7 @@ import {
   type DerivedSession,
   type RunEvent,
 } from "./events.js";
+import { readUsage, summarize } from "./telemetry.js";
 import {
   DEFAULT_POLICY,
   getTopology,
@@ -125,7 +126,13 @@ export interface StatusSummary {
   sessionId: string;
   topology?: string;
   state: DerivedSession["state"];
+  /** The figure the budget is enforced against: metered when available. */
   costUsd: number;
+  costSource: CostSource;
+  /** opencode's metered cost for this run's sessions, when the observer has any. */
+  meteredCostUsd: number | null;
+  /** Sum of the costUsd values passed to teamwork_verify. */
+  reportedCostUsd: number;
   budgetUsd: number;
   pctOfBudget: number;
   rounds: number;
@@ -141,6 +148,14 @@ export interface StatusSummary {
   deadletter: string[];
   chain: { ok: boolean; length: number; tipHash: string; reason?: string };
 }
+
+/**
+ * Where a cost figure came from. "metered" is opencode's own record of every
+ * assistant message in the run's session tree (provider-reported tokens,
+ * catalog prices). "reported" is the sum of what the orchestrating model
+ * passed to teamwork_verify, used only when nothing has been metered.
+ */
+export type CostSource = "metered" | "reported";
 
 // ─── Plan validation + scheduling ────────────────────────────────────
 
@@ -512,6 +527,8 @@ export class Engine {
     const events = this.events();
     const derived = deriveSession(events);
     const chain = verifyChain(events);
+    const metered = this.meteredCostUsd();
+    const spent = metered !== null ? { costUsd: metered, source: "metered" as const } : { costUsd: derived.costUsd, source: "reported" as const };
     const tasks = derived.order.map((id) => {
       const t = derived.tasks[id]!;
       return {
@@ -527,9 +544,12 @@ export class Engine {
       sessionId: derived.sessionId,
       ...(derived.topology ? { topology: derived.topology } : {}),
       state: derived.state,
-      costUsd: Number(derived.costUsd.toFixed(4)),
+      costUsd: Number(spent.costUsd.toFixed(4)),
+      costSource: spent.source,
+      meteredCostUsd: metered === null ? null : Number(metered.toFixed(4)),
+      reportedCostUsd: Number(derived.costUsd.toFixed(4)),
       budgetUsd: derived.budgetUsd,
-      pctOfBudget: derived.budgetUsd > 0 ? (derived.costUsd / derived.budgetUsd) * 100 : 0,
+      pctOfBudget: derived.budgetUsd > 0 ? (spent.costUsd / derived.budgetUsd) * 100 : 0,
       rounds: derived.rounds,
       tasks,
       pending: tasks.filter((t) => t.status === "PENDING").map((t) => t.taskId),
@@ -550,17 +570,30 @@ export class Engine {
     return derived;
   }
 
+  /** Metered cost for this run, or null when the usage observer has recorded nothing. */
+  meteredCostUsd(): number | null {
+    const records = readUsage(this.runDir);
+    return records.length > 0 ? summarize(records).costUsd : null;
+  }
+
+  /** The cost the budget is enforced against, and where it came from. */
+  effectiveCost(derived: DerivedSession = deriveSession(this.events())): { costUsd: number; source: CostSource } {
+    const metered = this.meteredCostUsd();
+    return metered !== null ? { costUsd: metered, source: "metered" } : { costUsd: derived.costUsd, source: "reported" };
+  }
+
   /** True when the budget cap (not the warning threshold) is reached. */
   budgetExhausted(): boolean {
     if (!this.budgetEnforced) return false;
     const derived = deriveSession(this.events());
-    return derived.budgetUsd > 0 && derived.costUsd >= derived.budgetUsd;
+    return derived.budgetUsd > 0 && this.effectiveCost(derived).costUsd >= derived.budgetUsd;
   }
 
   haltReason(): string | null {
     const derived = deriveSession(this.events());
-    if (this.budgetEnforced && derived.budgetUsd > 0 && derived.costUsd >= derived.budgetUsd) {
-      return `budget exhausted ($${derived.costUsd.toFixed(2)} of $${derived.budgetUsd.toFixed(2)})`;
+    const spent = this.effectiveCost(derived);
+    if (this.budgetEnforced && derived.budgetUsd > 0 && spent.costUsd >= derived.budgetUsd) {
+      return `budget exhausted ($${spent.costUsd.toFixed(2)} ${spent.source} of $${derived.budgetUsd.toFixed(2)})`;
     }
     const status = this.status();
     const open = status.tasks.filter(
@@ -581,12 +614,15 @@ export class Engine {
    */
   dispatchable(limit?: number): DagTask[] {
     const derived = deriveSession(this.events());
-    if (this.budgetEnforced && derived.budgetUsd > 0 && derived.costUsd >= derived.budgetUsd) {
+    const spent = this.effectiveCost(derived);
+    if (this.budgetEnforced && derived.budgetUsd > 0 && spent.costUsd >= derived.budgetUsd) {
+      // The figure and its source go into the hash-chained log, so the
+      // decision to stop is auditable even though usage.jsonl is not chained.
       appendEvent(this.runDir, {
         type: "budget.exhausted",
         sessionId: this.sessionId,
         ts: this.now(),
-        data: { costUsd: derived.costUsd, budgetUsd: derived.budgetUsd },
+        data: { costUsd: spent.costUsd, costSource: spent.source, budgetUsd: derived.budgetUsd },
       });
       return [];
     }
@@ -736,13 +772,14 @@ export class Engine {
 
     // Budget bookkeeping + terminal state.
     const after = deriveSession(this.events());
-    const pct = after.budgetUsd > 0 ? (after.costUsd / after.budgetUsd) * 100 : 0;
-    if (after.budgetUsd > 0 && pct >= this.haltAtPct && after.costUsd < after.budgetUsd) {
+    const afterCost = this.effectiveCost(after);
+    const pct = after.budgetUsd > 0 ? (afterCost.costUsd / after.budgetUsd) * 100 : 0;
+    if (after.budgetUsd > 0 && pct >= this.haltAtPct && afterCost.costUsd < after.budgetUsd) {
       appendEvent(this.runDir, {
         type: "budget.warning",
         sessionId: this.sessionId,
         ts: this.now(),
-        data: { costUsd: after.costUsd, budgetUsd: after.budgetUsd, pct: Number(pct.toFixed(1)) },
+        data: { costUsd: afterCost.costUsd, costSource: afterCost.source, budgetUsd: after.budgetUsd, pct: Number(pct.toFixed(1)) },
       });
     }
 

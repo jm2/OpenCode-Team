@@ -28,12 +28,30 @@ import { parseCommandFlags } from "./flags.js";
 import { getAllCommands, agentConfigs } from "./templates.js";
 import { TEAMWORK_TOOLS } from "./tools.js";
 import { readRunPointer, writeRunPointer } from "./run-pointer.js";
+import { TELEMETRY_ENV, UsageObserver } from "./telemetry.js";
 import { runDirFor } from "./worktree.js";
 // Command-flag parsing lives in ./flags.ts; see the export note at the end of this file.
 
 export const TeamPlugin: Plugin = async (ctx) => {
   const roles = new RoleRegistry();
   const runBySession = new Map<string, string>(); // opencode sessionID -> run sessionId
+
+  // Metered usage for every session tree that belongs to a run: the session
+  // that ran /teamwork and every subagent under it.
+  const usage = new UsageObserver({
+    runDirFor: (root) => {
+      const runId =
+        runBySession.get(root) ??
+        (() => {
+          const pointer = readRunPointer(ctx.directory);
+          return pointer?.opencodeSessionID === root ? pointer.sessionId : undefined;
+        })();
+      if (!runId) return null;
+      const dir = runDirFor(ctx.directory, runId);
+      return existsSync(dir) ? dir : null;
+    },
+    ...(process.env[TELEMETRY_ENV] ? { telemetryFile: process.env[TELEMETRY_ENV] } : {}),
+  });
 
   return {
     /**
@@ -191,6 +209,11 @@ export const TeamPlugin: Plugin = async (ctx) => {
     },
 
     event: async ({ event }) => {
+      try {
+        usage.onEvent(event as never);
+      } catch {
+        // Observation must never break a session.
+      }
       if (event.type !== "session.error") return;
       const sessionID = (event.properties as { sessionID?: string }).sessionID;
       if (!sessionID) return;

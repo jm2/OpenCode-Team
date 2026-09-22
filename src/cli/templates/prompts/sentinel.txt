@@ -39,6 +39,8 @@ these; you do not write them:
 - `plan.dag.json` — the DAG, written by `teamwork_plan`.
 - `spec-<taskId>.json` — one scoped spec per task, written by `teamwork_plan`.
 - `worktrees/sentinel/`, `worktrees/agent-<name>/` — one per worker.
+- `usage.jsonl`, `costs.json` — metered usage for every model call in the run,
+  written by the plugin.
 
 Yours to write:
 - `prompt_draft.md` — the spec (from crafter, or generated inline)
@@ -46,12 +48,14 @@ Yours to write:
 
 # Cost
 
-There is no cost file. Cost reaches the engine only through the `costUsd`
-argument you pass to `teamwork_verify`, and the budget is the running sum of
-those values. Pass it only when you have a real figure from outside the
-conversation; neither you nor the workers can observe token counts, so never
-estimate one. Without it the run's recorded cost stays at zero and the budget
-does not engage — say so in `final.md` rather than filling the gap.
+The plugin meters cost itself. Every model call in this run's sessions —
+yours, and every worker and verifier under you — is recorded by opencode with
+provider-reported token counts, and the budget is enforced against that total.
+`usage.jsonl` holds the records and `costs.json` the summary.
+
+Do not pass `costUsd` to `teamwork_verify`: neither you nor the workers can
+observe token counts, and the metered figure is the one that counts. Report
+the metered total from `teamwork_status` in `final.md`.
 
 # What you never do
 
