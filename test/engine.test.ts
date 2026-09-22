@@ -27,7 +27,7 @@ import { agentConfigFor, AGENT_TEMPLATES, getAllCommands } from "../src/template
 import { TOPOLOGIES, assertTopologiesResolve, getTopology, isTopology } from "../src/policy.js";
 import { RoleRegistry, isWriteTool } from "../src/guard.js";
 import { assertAgentName, assertSessionId } from "../src/worktree.js";
-import { parseCommandFlags } from "../src/index.js";
+import { parseCommandFlags } from "../src/flags.js";
 
 let root: string;
 

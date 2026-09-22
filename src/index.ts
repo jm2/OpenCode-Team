@@ -23,86 +23,12 @@ import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
 import { deriveSession, readEvents, verifyChain } from "./events.js";
 import { RoleRegistry } from "./guard.js";
-import { assertTopologiesResolve, DEFAULT_POLICY, isTopology, TOPOLOGY_NAMES } from "./policy.js";
+import { assertTopologiesResolve } from "./policy.js";
+import { parseCommandFlags } from "./flags.js";
 import { getAllCommands, agentConfigs } from "./templates.js";
 import { TEAMWORK_TOOLS } from "./tools.js";
 import { runDirFor } from "./worktree.js";
-
-export interface ParsedCommandFlags {
-  sessionId?: string;
-  topology?: string;
-  budgetUsd?: number;
-  maxConcurrency?: number;
-  request: string;
-  warnings: string[];
-}
-
-/**
- * Parse the flags the README has always advertised but nothing implemented.
- * Unknown topologies are reported, not silently accepted: the model is told
- * the valid set and the engine rejects the plan if it still gets it wrong.
- */
-export function parseCommandFlags(input: string, mint: () => string): ParsedCommandFlags {
-  const warnings: string[] = [];
-  const tokens = input.split(/\s+/).filter((t) => t.length > 0);
-  const rest: string[] = [];
-  let sessionId: string | undefined;
-  let topology: string | undefined;
-  let budgetUsd: number | undefined;
-  let maxConcurrency: number | undefined;
-
-  const valueOf = (token: string, flag: string, next: string | undefined): string | undefined => {
-    if (token === flag) return next;
-    if (token.startsWith(`${flag}=`)) return token.slice(flag.length + 1);
-    return undefined;
-  };
-
-  for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i]!;
-    const lookahead = tokens[i + 1];
-    let consumed = false;
-
-    for (const [flag, assign] of [
-      ["--topology", (v: string) => { topology = v; }],
-      ["--session", (v: string) => { sessionId = v; }],
-      ["--budget", (v: string) => { budgetUsd = Number(v); }],
-      ["--concurrency", (v: string) => { maxConcurrency = Number.parseInt(v, 10); }],
-    ] as Array<[string, (v: string) => void]>) {
-      const value = valueOf(token, flag, lookahead);
-      if (value !== undefined) {
-        assign(value);
-        consumed = true;
-        // `--flag value` consumes the next token; `--flag=value` does not.
-        if (token === flag) i += 1;
-        break;
-      }
-    }
-
-    if (!consumed) rest.push(token);
-  }
-
-  if (topology && !isTopology(topology)) {
-    warnings.push(`unknown --topology "${topology}"; valid: ${TOPOLOGY_NAMES.join(", ")}. Ignoring it.`);
-    topology = undefined;
-  }
-  if (budgetUsd !== undefined && (!Number.isFinite(budgetUsd) || budgetUsd <= 0)) {
-    warnings.push(`--budget must be a positive number; got "${budgetUsd}". Ignoring it.`);
-    budgetUsd = undefined;
-  }
-  if (maxConcurrency !== undefined && (!Number.isInteger(maxConcurrency) || maxConcurrency <= 0)) {
-    warnings.push(`--concurrency must be a positive integer. Ignoring it.`);
-    maxConcurrency = undefined;
-  }
-
-  return {
-    ...(sessionId ? { sessionId } : { sessionId: mint() }),
-    ...(topology ? { topology } : {}),
-    ...(budgetUsd !== undefined ? { budgetUsd } : {}),
-    ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
-    request: rest.join(" ").trim(),
-    warnings,
-  };
-}
+// Command-flag parsing lives in ./flags.ts; see the export note at the end of this file.
 
 interface RunPointer {
   sessionId: string;
@@ -317,12 +243,18 @@ export const TeamPlugin: Plugin = async (ctx) => {
   };
 };
 
+/*
+ * Every runtime export of this module must be the plugin function.
+ *
+ * opencode's plugin loader walks Object.values() of the module, calls each
+ * distinct function as a plugin, and throws "Plugin export is not a
+ * function" for anything else, skipping the plugin entirely. It used to
+ * export `id` (a string) and DEFAULT_POLICY (an object) here, so the plugin
+ * never loaded, and opencode only says so in its log. Aliases of the same
+ * function are fine: the loader de-duplicates them. Helpers belong in their
+ * own modules (parseCommandFlags is in ./flags.ts; DEFAULT_POLICY is in
+ * ./policy.ts and the package's "./policy" export).
+ */
 export default TeamPlugin;
-
-// Named exports for v1 / v2 dual compatibility.
-export const id = "opencode-teamwork";
 export { TeamPlugin as server };
 export { TeamPlugin as setup };
-
-/** Re-exported for callers that want the policy defaults. */
-export { DEFAULT_POLICY };
