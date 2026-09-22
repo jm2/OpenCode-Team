@@ -1,7 +1,6 @@
 ---
 description: "Verifier — the forcing function. Receives a worker's patch.diff + spec.json, runs the verification plan, returns verification_report.json with PASS/FAIL + checks + evidence. Hides itself; only the Sentinel invokes."
 mode: subagent
-model: anthropic/claude-sonnet-4-5
 temperature: 0.0
 permission:
   edit: deny

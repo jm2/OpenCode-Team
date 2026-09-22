@@ -1,7 +1,6 @@
 ---
 description: "Read-only context gatherer. Runs FIRST in any long Teamwork run. Pulls the relevant code, git history, related docs, and any failing tests into a single scout-report.md. Never edits."
 mode: subagent
-model: anthropic/claude-sonnet-4-5
 temperature: 0.0
 permission:
   edit: deny

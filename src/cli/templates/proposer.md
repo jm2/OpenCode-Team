@@ -1,7 +1,6 @@
 ---
 description: "Generates a candidate solution for a Teamwork run. One proposer = one candidate. The orchestrator dispatches multiple proposers in parallel; you never run twice for the same orchestrator prompt."
 mode: subagent
-model: anthropic/claude-sonnet-4-5
 temperature: 0.4
 permission:
   edit: ask

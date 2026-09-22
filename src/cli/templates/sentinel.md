@@ -1,7 +1,6 @@
 ---
 description: "Sentinel / coordinator. The user-facing command for /teamwork. Loads the spec, picks a topology, drives the run engine (teamwork_plan / _dispatch / _verify), and merges on success. Equivalent to Antigravity's Sentinel role."
 mode: primary
-model: anthropic/claude-sonnet-4-5
 temperature: 0.2
 permission:
   edit: allow

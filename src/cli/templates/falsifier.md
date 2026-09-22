@@ -1,7 +1,6 @@
 ---
 description: "Attacks a single candidate. Your job is to find flaws. If you cannot find a flaw, you must explicitly say so — silence is not acceptable."
 mode: subagent
-model: anthropic/claude-sonnet-4-5
 temperature: 0.1
 permission:
   edit: deny
