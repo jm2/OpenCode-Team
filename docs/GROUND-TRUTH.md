@@ -198,6 +198,16 @@ Three non-Zod parses are also worth knowing about:
   vendor ladders in section 8 with no warning.
 - `src/cost.ts:65` — orphaned, see section 3.
 
+**Failure behaviour now** (boundary 1/2 only): `teamwork_verify` routes the raw
+text through `repairArtifact` (`src/repair.ts`). Every submission is written to
+`<runDir>/repair/<taskId>.attempt-N.raw.json` before it is judged. A failure
+returns the Zod error plus a generated shape sketch and a repair instruction,
+counted against a per-task ledger. After two repairs the third failure is
+terminal: the run is told to stop resubmitting, to not hand-write a substitute,
+and to report the preserved paths to the user. The round is never counted and
+no object is fabricated. A genuinely valid report submitted later is still
+accepted, and says how many repairs it took.
+
 **No native structured outputs are requested anywhere.** Grepping the whole tree
 for `json_schema`, `response_format`, `responseFormat`, `structuredOutput`,
 `zodResponseFormat` and `toJSONSchema` returns nothing. The plugin never asks a

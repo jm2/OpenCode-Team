@@ -1,0 +1,263 @@
+/**
+ * Phase 2: bounded repair at the model-authored artifact boundary.
+ *
+ * The invariants under test, in priority order:
+ *   1. a malformed artifact is never coerced or fabricated into a valid one;
+ *   2. the loop is bounded in code, not by the model's patience;
+ *   3. the raw output survives to disk on every attempt, including the last.
+ */
+
+import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { z } from "zod";
+import { VerificationReportSchema } from "../src/artifacts.ts";
+import {
+  DEFAULT_MAX_REPAIRS,
+  describeSchema,
+  readLedger,
+  repairArtifact,
+} from "../src/repair.ts";
+
+function runDir(): string {
+  return mkdtempSync(join(tmpdir(), "repair-"));
+}
+
+const GOOD = {
+  taskId: "t1",
+  verifierAgent: "team/verifier",
+  verifierModel: "xiaomi/mimo-v2.6-pro",
+  timestamp: "2026-09-22T00:00:00Z",
+  status: "PASS",
+  checks: [{ name: "tests", type: "programmatic", passed: true, cmd: "bun test", exitCode: 0 }],
+  feedbackForWorker: "",
+};
+
+const opts = (dir: string, raw: string) => ({
+  runDir: dir,
+  taskId: "t1",
+  raw,
+  label: "verification_report.json",
+});
+
+describe("happy path", () => {
+  test("a valid artifact parses with no repair", () => {
+    const dir = runDir();
+    const out = repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(GOOD)));
+    expect(out.kind).toBe("ok");
+    if (out.kind !== "ok") return;
+    expect(out.recoveredAfter).toBe(0);
+    expect(out.value.status).toBe("PASS");
+  });
+
+  test("raw output is preserved even when it validates", () => {
+    const dir = runDir();
+    repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(GOOD)));
+    expect(existsSync(join(dir, "repair", "t1.attempt-1.raw.json"))).toBe(true);
+  });
+});
+
+describe("bounded repair", () => {
+  test("malformed JSON yields a repair instruction, not a crash", () => {
+    const dir = runDir();
+    const out = repairArtifact(VerificationReportSchema, opts(dir, "{ not json"));
+    expect(out.kind).toBe("repair");
+    if (out.kind !== "repair") return;
+    expect(out.attempt).toBe(1);
+    expect(out.error).toContain("not valid JSON");
+    expect(out.instruction).toContain("Re-emit the WHOLE artifact");
+  });
+
+  test("the Zod error is fed back verbatim", () => {
+    const dir = runDir();
+    const missingChecks = { ...GOOD, checks: [] };
+    const out = repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(missingChecks)));
+    expect(out.kind).toBe("repair");
+    if (out.kind !== "repair") return;
+    expect(out.error).toContain("checks");
+    expect(out.instruction).toContain(out.error);
+  });
+
+  test("the expected shape is included in the instruction", () => {
+    const dir = runDir();
+    const out = repairArtifact(VerificationReportSchema, opts(dir, "null"));
+    expect(out.kind).toBe("repair");
+    if (out.kind !== "repair") return;
+    for (const field of ["taskId", "verifierAgent", "status", "checks", "exitCode"]) {
+      expect(out.instruction).toContain(field);
+    }
+    expect(out.instruction).toContain('"PASS" | "FAIL"');
+  });
+
+  test("re-prompts at most twice, then gives up", () => {
+    const dir = runDir();
+    const bad = JSON.stringify({ taskId: "t1" });
+
+    const first = repairArtifact(VerificationReportSchema, opts(dir, bad));
+    expect(first.kind).toBe("repair");
+
+    const second = repairArtifact(VerificationReportSchema, opts(dir, bad));
+    expect(second.kind).toBe("repair");
+    if (second.kind === "repair") expect(second.attempt).toBe(2);
+
+    const third = repairArtifact(VerificationReportSchema, opts(dir, bad));
+    expect(third.kind).toBe("exhausted");
+    if (third.kind !== "exhausted") return;
+    expect(third.attempts).toBe(3);
+    expect(third.maxRepairs).toBe(DEFAULT_MAX_REPAIRS);
+  });
+
+  test("the bound is configurable and honoured", () => {
+    const dir = runDir();
+    const bad = "{}";
+    expect(repairArtifact(VerificationReportSchema, { ...opts(dir, bad), maxRepairs: 1 }).kind).toBe(
+      "repair",
+    );
+    expect(repairArtifact(VerificationReportSchema, { ...opts(dir, bad), maxRepairs: 1 }).kind).toBe(
+      "exhausted",
+    );
+  });
+
+  test("a later valid submission is accepted and resets the ledger", () => {
+    const dir = runDir();
+    repairArtifact(VerificationReportSchema, opts(dir, "{}"));
+    const out = repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(GOOD)));
+    expect(out.kind).toBe("ok");
+    if (out.kind !== "ok") return;
+    expect(out.recoveredAfter).toBe(1);
+
+    // Ledger reset, so a later unrelated failure starts from attempt 1.
+    const after = repairArtifact(VerificationReportSchema, opts(dir, "{}"));
+    expect(after.kind).toBe("repair");
+    if (after.kind === "repair") expect(after.attempt).toBe(1);
+  });
+
+  test("attempts are tracked per task, not globally", () => {
+    const dir = runDir();
+    for (const id of ["a", "a", "a"]) {
+      repairArtifact(VerificationReportSchema, { ...opts(dir, "{}"), taskId: id });
+    }
+    const other = repairArtifact(VerificationReportSchema, { ...opts(dir, "{}"), taskId: "b" });
+    expect(other.kind).toBe("repair");
+    if (other.kind === "repair") expect(other.attempt).toBe(1);
+  });
+});
+
+describe("failing loudly preserves the evidence", () => {
+  test("every raw submission is on disk and named in the failure", () => {
+    const dir = runDir();
+    const bodies = ['{"a":1}', '{"b":2}', '{"c":3}'];
+    let last = repairArtifact(VerificationReportSchema, opts(dir, bodies[0]!));
+    last = repairArtifact(VerificationReportSchema, opts(dir, bodies[1]!));
+    last = repairArtifact(VerificationReportSchema, opts(dir, bodies[2]!));
+
+    expect(last.kind).toBe("exhausted");
+    if (last.kind !== "exhausted") return;
+    expect(last.rawPaths.length).toBe(3);
+    for (const [i, p] of last.rawPaths.entries()) {
+      expect(existsSync(p)).toBe(true);
+      expect(readFileSync(p, "utf-8")).toBe(bodies[i]!);
+      expect(last.instruction).toContain(p);
+    }
+  });
+
+  test("the failure tells the model not to fabricate a substitute", () => {
+    const dir = runDir();
+    let out = repairArtifact(VerificationReportSchema, opts(dir, "{}"));
+    out = repairArtifact(VerificationReportSchema, opts(dir, "{}"));
+    out = repairArtifact(VerificationReportSchema, opts(dir, "{}"));
+    expect(out.kind).toBe("exhausted");
+    if (out.kind !== "exhausted") return;
+    expect(out.instruction).toContain("do NOT hand-write a substitute");
+    expect(out.instruction).toContain("Do NOT resubmit");
+  });
+
+  test("the ledger records the failure for post-mortem", () => {
+    const dir = runDir();
+    repairArtifact(VerificationReportSchema, opts(dir, "{}"));
+    const ledger = readLedger(dir, "t1");
+    expect(ledger).not.toBeNull();
+    expect(ledger!.attempts).toBe(1);
+    expect(ledger!.rawPaths.length).toBe(1);
+    expect(ledger!.firstFailedAt).toBeTruthy();
+  });
+});
+
+describe("no silent coercion (the load-bearing invariant)", () => {
+  test("a PASS with no executed check is never repaired into validity", () => {
+    const dir = runDir();
+    const rubricOnly = {
+      ...GOOD,
+      checks: [{ name: "looks fine", type: "rubric", passed: true }],
+    };
+    // Zod accepts the shape; the engine's validateReport is what rejects the
+    // verdict. What matters here is that repair never ADDS a cmd/exitCode.
+    const out = repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(rubricOnly)));
+    expect(out.kind).toBe("ok");
+    if (out.kind !== "ok") return;
+    expect(out.value.checks[0]!.cmd).toBeUndefined();
+    expect(out.value.checks[0]!.exitCode).toBeUndefined();
+  });
+
+  test("an exhausted repair returns no value at all", () => {
+    const dir = runDir();
+    let out = repairArtifact(VerificationReportSchema, opts(dir, "garbage"));
+    out = repairArtifact(VerificationReportSchema, opts(dir, "garbage"));
+    out = repairArtifact(VerificationReportSchema, opts(dir, "garbage"));
+    expect(out.kind).toBe("exhausted");
+    expect((out as Record<string, unknown>).value).toBeUndefined();
+  });
+
+  test("fields absent from the model's output are not invented", () => {
+    const dir = runDir();
+    const noFeedback = { ...GOOD };
+    delete (noFeedback as Record<string, unknown>).feedbackForWorker;
+    const out = repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(noFeedback)));
+    expect(out.kind).toBe("ok");
+    if (out.kind !== "ok") return;
+    // Zod's declared .default("") applies — that is the schema's contract,
+    // not repair inventing evidence. Evidence fields stay untouched.
+    expect(out.value.feedbackForWorker).toBe("");
+    expect(out.value.checks[0]!.exitCode).toBe(0);
+  });
+});
+
+describe("describeSchema", () => {
+  test("renders nested objects, arrays, enums and optionality", () => {
+    const s = describeSchema(VerificationReportSchema);
+    expect(s).toContain("taskId: string");
+    expect(s).toContain('status: "PASS" | "FAIL"');
+    expect(s).toContain("checks:");
+    expect(s).toContain("cmd?: string");
+    expect(s).toContain("exitCode?: number");
+  });
+
+  test("degrades instead of throwing on an exotic schema", () => {
+    expect(() => describeSchema(z.union([z.string(), z.number()]))).not.toThrow();
+    expect(() => describeSchema(z.record(z.string()))).not.toThrow();
+    expect(() => describeSchema(z.lazy(() => z.string()))).not.toThrow();
+    expect(describeSchema(z.string())).toBe("string");
+  });
+});
+
+describe("no native structured outputs are requested anywhere", () => {
+  test("the tree contains no json_schema / response_format request", async () => {
+    const { Glob } = await import("bun");
+    const root = join(import.meta.dir, "..", "src");
+    const hits: string[] = [];
+    for await (const file of new Glob("**/*.ts").scan({ cwd: root, absolute: true })) {
+      // Strip comments: the modules that implement the fallback path discuss
+      // these names in prose. Only an actual request in code is a finding.
+      const code = readFileSync(file, "utf-8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+      for (const needle of ["json_schema", "response_format", "responseFormat", "zodResponseFormat"]) {
+        if (code.includes(needle)) hits.push(`${file}: ${needle}`);
+      }
+    }
+    // Phase 2.4 has no code to make conditional — this test is the proof,
+    // and will fail loudly if someone later adds a provider-level request.
+    expect(hits).toEqual([]);
+  });
+});

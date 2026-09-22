@@ -33,6 +33,7 @@ import { ENGINE_ROLES } from "./guard.js";
 import { DEFAULT_POLICY, TOPOLOGY_NAMES, type Policy } from "./policy.js";
 import { createWorktreeManager, runDirFor } from "./worktree.js";
 import { ALL_SEATS_ENV, singleModelRouting } from "./cli/all-seats.js";
+import { repairArtifact, VERIFICATION_REPORT_HINT } from "./repair.js";
 
 // ─── Shared helpers ──────────────────────────────────────────────────
 
@@ -409,18 +410,22 @@ export const teamworkVerify: ToolDefinition = tool({
       return `cannot open run ${args.sessionId} — ${(err as Error).message}`;
     }
 
-    let raw: unknown;
+    // The one free-form model-JSON boundary in the plugin. A model that cannot
+    // be schema-constrained (MiMo has JSON mode but no native json_schema) has
+    // to hit this shape by prompting alone, so failures get a bounded repair
+    // loop rather than an open-ended "try again" — and the raw output is kept
+    // either way. See docs/GROUND-TRUTH.md §6 and src/repair.ts.
+    const runDir = runDirFor(context.directory, args.sessionId);
+    let rawText: string;
     if (args.reportPath) {
       if (!existsSync(args.reportPath)) {
         return `no report at ${args.reportPath} — the verifier must write it before you submit`;
       }
-      try {
-        raw = JSON.parse(readFileSync(args.reportPath, "utf-8"));
-      } catch (err) {
-        return `report at ${args.reportPath} is not valid JSON — ${(err as Error).message}`;
-      }
+      rawText = readFileSync(args.reportPath, "utf-8");
     } else {
-      raw = {
+      // Assembled from tool arguments the tool layer already type-checked.
+      // Routed through the same path so one code path owns validation.
+      rawText = JSON.stringify({
         taskId: args.taskId,
         verifierAgent: args.verifierAgent ?? "team/verifier",
         verifierModel: args.verifierModel ?? "unknown",
@@ -429,11 +434,41 @@ export const teamworkVerify: ToolDefinition = tool({
         checks: args.checks ?? [],
         feedbackForWorker: args.feedbackForWorker ?? "",
         fatalFindings: args.fatalFindings ?? [],
-      };
+      });
     }
 
-    const parsed = parseArtifact(VerificationReportSchema, raw, "verification_report.json");
-    if (!parsed.ok) return `report rejected — ${parsed.error}`;
+    const repaired = repairArtifact(VerificationReportSchema, {
+      runDir,
+      taskId: args.taskId,
+      raw: rawText,
+      label: "verification_report.json",
+      hint: VERIFICATION_REPORT_HINT,
+    });
+
+    if (repaired.kind === "exhausted") {
+      // Loud, terminal, evidence preserved. The round is NOT counted and no
+      // object is fabricated to stand in for the one that never parsed.
+      return [
+        `report REJECTED for ${args.taskId} — validation exhausted.`,
+        "",
+        repaired.instruction,
+        "",
+        statusLine(engine),
+      ].join("\n");
+    }
+    if (repaired.kind === "repair") {
+      return [
+        `report REJECTED for ${args.taskId} (round not counted):`,
+        "",
+        repaired.instruction,
+      ].join("\n");
+    }
+
+    const parsed = { ok: true as const, value: repaired.value };
+    const recovered =
+      repaired.recoveredAfter > 0
+        ? `  (accepted after ${repaired.recoveredAfter} repair attempt(s))\n`
+        : "";
 
     const outcome = engine.recordRound({
       taskId: args.taskId,
@@ -459,6 +494,7 @@ export const teamworkVerify: ToolDefinition = tool({
 
     return [
       head,
+      recovered.trimEnd(),
       outcome.nextModel ? `  next attempt escalates to: ${outcome.nextModel}` : "",
       outcome.status === "PENDING" ? `  feed the verifier's feedback back to a fresh worker` : "",
       "",
