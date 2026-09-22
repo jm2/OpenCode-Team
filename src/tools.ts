@@ -251,7 +251,11 @@ export const teamworkPlan: ToolDefinition = tool({
     return [
       `run created: ${sessionId}`,
       `run dir: ${runDir}`,
-      `topology: ${args.topology} | concurrency cap: ${engine.maxConcurrency} | budget: $${engine.budgetUsd.toFixed(2)} (halt at ${engine.haltAtPct}%)`,
+      // "halt at N%" described a halt that does not happen: haltAtPct only
+      // emits a budget.warning event, and dispatch continues until the cap
+      // itself is reached. The README's prose has always said so; this line
+      // did not, and it is what the sentinel actually reads.
+      `topology: ${args.topology} | concurrency cap: ${engine.maxConcurrency} | budget: $${engine.budgetUsd.toFixed(2)} (warns at ${engine.haltAtPct}%, refuses dispatch at 100%)`,
       `waves: ${waves.map((w, i) => `[${i + 1}] ${w.join(" + ")}`).join("  ")}`,
       worktreeNotes.length > 0 ? `worktrees:\n  ${worktreeNotes.join("\n  ")}` : "",
       `specs written: ${tasks.map((t) => `spec-${t.taskId}.json`).join(", ")}`,
