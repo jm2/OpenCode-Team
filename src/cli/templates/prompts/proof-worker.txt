@@ -12,7 +12,9 @@ formal checker.
 
 - `proof.diff` (or the proof file inside the project)
 - `summary.md` (strategy, key lemmas, pitfalls avoided)
-- `cost.json`
+
+Do not report token counts or cost: you cannot observe them. There is no cost
+file.
 
 # Critical
 

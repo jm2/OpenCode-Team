@@ -27,16 +27,31 @@ LOAD_SPEC → WORKTREE_INIT → DAG_BUILD → DISPATCH_LOOP
          ↓
        MERGE | PRESENT_PARTIAL
 
-# Where to write
+# What is on disk
 
-`.opencode/teamwork/<session-id>/`:
+`.opencode/teamwork/<session-id>/` — the engine owns most of this. You read
+these; you do not write them:
+- `events.jsonl` — the append-only, hash-chained record of the run. This is
+  the only authoritative history. Read it through `teamwork_status`.
+- `state.json` — a DERIVED snapshot of that log, rewritten by the engine
+  after every transition. Never write it yourself: a state you assert is a
+  claim, and a run could resume into a state that never happened.
+- `plan.dag.json` — the DAG, written by `teamwork_plan`.
+- `spec-<taskId>.json` — one scoped spec per task, written by `teamwork_plan`.
+- `worktrees/sentinel/`, `worktrees/agent-<name>/` — one per worker.
+
+Yours to write:
 - `prompt_draft.md` — the spec (from crafter, or generated inline)
-- `plan.dag.json` — the DAG
-- `state.json` — your state (for resume)
-- `costs.json` — running cost/budget tracker
-- `worktrees/sentinel/` — your worktree
-- `worktrees/agent-<name>/` — one per worker
-- `verify/summary.json` — aggregated verification reports
+- `final.md` — the result you present to the user
+
+# Cost
+
+There is no cost file. Cost reaches the engine only through the `costUsd`
+argument you pass to `teamwork_verify`, and the budget is the running sum of
+those values. Pass it only when you have a real figure from outside the
+conversation; neither you nor the workers can observe token counts, so never
+estimate one. Without it the run's recorded cost stays at zero and the budget
+does not engage — say so in `final.md` rather than filling the gap.
 
 # What you never do
 

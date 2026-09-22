@@ -1,13 +1,14 @@
 /**
  * Cost / budget tracker for Teamwork.
  *
- * Each agent call reports its token + cost usage. We aggregate per
- * session. When the session approaches its budget cap (default 80%),
- * the Sentinel is expected to halt non-essential workers and prompt
- * the user.
+ * The model catalog is a static table of rough USD-per-1k-token rates. This is
+ * intentionally coarse — the user can override it per run.
  *
- * The model catalog is a static table of rough USD-per-1k-token
- * rates. This is intentionally coarse — the user can override.
+ * NOTE: nothing in the plugin currently imports this module. The run engine's
+ * budget is the running sum of the `costUsd` values the orchestrating agent
+ * passes to `teamwork_verify` (see src/engine.ts), and `costs.json` is not
+ * written by a run. Wire this in before relying on it, and read `unpriced()`
+ * when you do: a model missing from the table contributes zero.
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -79,7 +80,14 @@ function save(state: CostState, sessionDir: string): void {
 }
 
 function estimateCost(model: string, input: number, output: number, rates: Record<string, ModelRate>): number {
-  const rate = rates[model] ?? rates["anthropic/claude-sonnet-4-5"]!;
+  const rate = rates[model];
+  if (!rate) {
+    // Falling back to a hard-coded vendor rate produced a confident,
+    // arbitrary number: an unknown model billed at 0.003/0.015 per 1k comes
+    // out 13.8x high against a provider charging 0.435/0.87 per 1M. Report
+    // zero; `unpriced()` on the tracker names the gap.
+    return 0;
+  }
   return (input / 1000) * rate.input + (output / 1000) * rate.output;
 }
 
@@ -90,6 +98,9 @@ export interface CostTracker {
   shouldHalt(): boolean;
   state(): CostState;
   flush(): void;
+  /** Models recorded with no rate-table entry. Their cost counted as zero,
+   *  so a total is a floor, not a figure to bill against. */
+  unpriced(): string[];
 }
 
 export function createCostTracker(
@@ -125,6 +136,9 @@ export function createCostTracker(
     },
     state() {
       return state;
+    },
+    unpriced() {
+      return [...new Set(state.entries.map((e) => e.model))].filter((m) => !state.rates[m]);
     },
     flush() {
       save(state, sessionDir);
