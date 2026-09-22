@@ -103,7 +103,14 @@ export interface RouteRule {
 
 export interface Policy {
   version: number;
-  budget: { perTaskUsd: number; perSessionUsd: number; haltAtPct: number };
+  /**
+   * `perSessionUsd` is optional on purpose. When a project's policy file sets
+   * it, it applies to every run; when nothing sets it, each topology's own
+   * `defaultMaxCostUsd` applies. The shipped default used to set it to 20,
+   * and because the engine consults it before the topology, every topology's
+   * default budget was unreachable.
+   */
+  budget: { perTaskUsd: number; perSessionUsd?: number; haltAtPct: number };
   routing: Record<string, RouteRule>;
   /** Prompt fragment files, keyed by role (data, not code). */
   promptFragments: Record<string, string>;
@@ -111,7 +118,7 @@ export interface Policy {
 
 export const DEFAULT_POLICY: Policy = {
   version: 1,
-  budget: { perTaskUsd: 2.5, perSessionUsd: 20, haltAtPct: 80 },
+  budget: { perTaskUsd: 2.5, haltAtPct: 80 },
   routing: {
     // Cheapest-first ladders. The engine escalates a task one rung per
     // failed round and records the rung it used, so the learning loop can
