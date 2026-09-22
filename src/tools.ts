@@ -28,7 +28,7 @@ import {
   parseArtifact,
 } from "./artifacts.js";
 import { Engine, dispatchWaves, type DagTask, type VerificationReport } from "./engine.js";
-import { verifyChain, readEvents, deriveSession, writeSnapshot } from "./events.js";
+import { verifyChain, describeLogDamage, readEventLog, readEvents, deriveSession, writeSnapshot } from "./events.js";
 import { ENGINE_ROLES } from "./guard.js";
 import { DEFAULT_POLICY, TOPOLOGY_NAMES, type Policy } from "./policy.js";
 import { createWorktreeManager, runDirFor } from "./worktree.js";
@@ -497,7 +497,15 @@ export const teamworkResume: ToolDefinition = tool({
     }
     const runDir = runDirFor(context.directory, args.sessionId);
     if (!existsSync(runDir)) return `no run at ${runDir}`;
-    const events = readEvents(runDir);
+    const log = readEventLog(runDir);
+    const events = log.events;
+    const damage = describeLogDamage(log);
+    if (damage) {
+      return [
+        `REFUSING to resume ${args.sessionId}: ${damage}`,
+        "Inspect events.jsonl before continuing — the log is the only record of what ran.",
+      ].join("\n");
+    }
     if (events.length === 0) return `run ${args.sessionId} has no events`;
 
     const chain = verifyChain(events);

@@ -21,7 +21,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
-import { deriveSession, readEvents, verifyChain } from "./events.js";
+import { deriveSession, describeLogDamage, readEventLog, verifyChain } from "./events.js";
 import { RoleRegistry } from "./guard.js";
 import { assertTopologiesResolve, DEFAULT_POLICY, isTopology, TOPOLOGY_NAMES } from "./policy.js";
 import { getAllCommands, agentConfigs } from "./templates.js";
@@ -254,7 +254,15 @@ export const TeamPlugin: Plugin = async (ctx) => {
       if (!runId) return;
       const runDir = runDirFor(ctx.directory, runId);
       if (!existsSync(runDir)) return;
-      const events = readEvents(runDir);
+      const log = readEventLog(runDir);
+      const events = log.events;
+      const damage = describeLogDamage(log);
+      if (damage) {
+        output.context.push(
+          `Teamwork run ${runId}: ${damage} Do not continue from remembered state; call teamwork_resume and report the damage to the user.`,
+        );
+        return;
+      }
       if (events.length === 0) return;
       if (!verifyChain(events).ok) {
         output.context.push(
