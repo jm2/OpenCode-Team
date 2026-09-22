@@ -23,6 +23,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -80,7 +81,30 @@ export interface DerivedSession {
   tipHash: string;
 }
 
-const TIP_CACHE = new Map<string, RunEvent>();
+/**
+ * Cached tip per log file, so a burst of appends does not re-read the whole
+ * file each time.
+ *
+ * The cached entry carries the file size and mtime it was valid for. Without that check
+ * the cache outranked the file: if anything else changed the log — a second
+ * process, a restore from backup, an operator editing it — `appendEvent` went
+ * on building from the remembered tip, writing a duplicate `seq` and a
+ * `prevHash` pointing at an event that was no longer last. That produces a
+ * chain which `verifyChain` then reports as corrupt, with the append that
+ * caused it looking innocent.
+ */
+interface CachedTip {
+  event: RunEvent;
+  stamp: string;
+}
+
+const TIP_CACHE = new Map<string, CachedTip>();
+
+/** Drop a cached tip. Exported for tests and for callers that know the log
+ *  changed underneath them. */
+export function forgetTip(runDir: string): void {
+  TIP_CACHE.delete(eventLogPath(runDir));
+}
 
 export function eventLogPath(runDir: string): string {
   return join(runDir, "events.jsonl");
@@ -100,18 +124,38 @@ export function hashEvent(prevHash: string, event: Omit<RunEvent, "hash">): stri
   return createHash("sha256").update(`${prevHash}\n${canonical(event)}`).digest("hex");
 }
 
+/** Size plus modification time: cheap, and changes whenever the file does. */
+function fileStamp(path: string): string | null {
+  try {
+    const st = statSync(path);
+    return `${st.size}:${st.mtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+
 function readTip(runDir: string): RunEvent | null {
   const path = eventLogPath(runDir);
-  const key = path;
-  const cached = TIP_CACHE.get(key);
-  if (cached) return cached;
-  if (!existsSync(path)) return null;
+  const stamp = fileStamp(path);
+  if (stamp === null) {
+    // The log is gone. A remembered tip would resurrect a chain that no
+    // longer exists on disk.
+    TIP_CACHE.delete(path);
+    return null;
+  }
+
+  const cached = TIP_CACHE.get(path);
+  if (cached && cached.stamp === stamp) return cached.event;
+
   const raw = readFileSync(path, "utf-8");
   const lines = raw.split("\n").filter((l) => l.trim().length > 0);
   const last = lines[lines.length - 1];
-  if (!last) return null;
+  if (!last) {
+    TIP_CACHE.delete(path);
+    return null;
+  }
   const parsed = JSON.parse(last) as RunEvent;
-  TIP_CACHE.set(key, parsed);
+  TIP_CACHE.set(path, { event: parsed, stamp });
   return parsed;
 }
 
@@ -146,8 +190,11 @@ export function appendEvent(runDir: string, input: AppendInput): RunEvent {
     prevHash,
   };
   const event: RunEvent = { ...draft, hash: hashEvent(prevHash, draft) };
-  appendFileSync(eventLogPath(runDir), `${JSON.stringify(event)}\n`, "utf-8");
-  TIP_CACHE.set(eventLogPath(runDir), event);
+  const path = eventLogPath(runDir);
+  appendFileSync(path, `${JSON.stringify(event)}\n`, "utf-8");
+  const stamp = fileStamp(path);
+  if (stamp === null) TIP_CACHE.delete(path);
+  else TIP_CACHE.set(path, { event, stamp });
   return event;
 }
 
