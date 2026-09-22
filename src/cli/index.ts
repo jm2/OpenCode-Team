@@ -24,6 +24,8 @@ import { fileURLToPath } from "node:url";
 import {
   ALL_SEATS_ENV,
   allSeatsAgents,
+  billingFor,
+  describeWithOpencode,
   findAlias,
   findVendorModelStrings,
   protocolFor,
@@ -34,6 +36,7 @@ import {
   type ResolvedProviderModel,
 } from "./all-seats.js";
 import { parseJsonc } from "./jsonc.js";
+import { isTeamworkEntry, resolvePluginArg } from "./plugin-spec.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -366,12 +369,12 @@ function ensurePluginListed(config: Record<string, any>, pkg: string): void {
 }
 
 /**
- * True for an npm spec naming this package: "opencode-teamwork" or
- * "opencode-teamwork@<anything>". A bare prefix test would also match an
- * unrelated "opencode-teamwork-foo".
+ * True for an entry that loads this plugin: an npm spec of this package, or a
+ * file:// URL into a local build of it. A bare prefix test would also match
+ * an unrelated "opencode-teamwork-foo".
  */
 export function isTeamworkPluginSpec(spec: unknown): boolean {
-  return typeof spec === "string" && (spec === "opencode-teamwork" || spec.startsWith("opencode-teamwork@"));
+  return isTeamworkEntry(spec);
 }
 
 /**
@@ -436,21 +439,32 @@ function resolveAllSeats(
   return { modelId: result.model.modelId, source: `preset ${alias.name}`, resolved: result.model };
 }
 
-/** Report what the resolver found, so the operator can confirm the id. */
+/**
+ * Report what the resolver found, so the operator can confirm the id, and
+ * what opencode itself says about that model: the wire protocol, the endpoint
+ * (which also tells pay-as-you-go from a Token Plan), and reasoning.
+ */
 function reportResolvedModel(info: { modelId: string; source: string; resolved?: ResolvedProviderModel }): void {
   console.log(`\n  Single-model baseline: every seat gets "${info.modelId}" (${info.source}).`);
-  const r = info.resolved;
-  if (!r) return;
-  const protocol = protocolFor(r.npm);
-  console.log(`    provider:  ${r.providerKey}${r.npm ? ` (npm: ${r.npm})` : ""}`);
-  if (r.displayName) console.log(`    name:      ${r.displayName}`);
-  if (r.baseURL) console.log(`    baseURL:   ${r.baseURL}`);
-  console.log(
-    `    protocol:  ${protocol === "unknown" ? "UNKNOWN — inspect the provider npm package by hand" : protocol}`,
-  );
-  if (r.reasoning !== undefined) {
-    console.log(`    reasoning: ${r.reasoning ? "on" : "off"} (model-level, so uniform across seats)`);
+  const described = describeWithOpencode(info.modelId);
+  const npm = described?.npm ?? info.resolved?.npm;
+  const url = described?.url ?? info.resolved?.baseURL;
+  const reasoning = described?.reasoning ?? info.resolved?.reasoning;
+  if (!described && !info.resolved?.npm) {
+    console.log(`    (opencode not on PATH, or it does not list ${info.modelId}; protocol and endpoint unknown)`);
+    console.log(`    Check with: opencode models ${info.modelId.split("/")[0]} --verbose`);
+    return;
   }
+  const protocol = protocolFor(npm);
+  if (described?.name ?? info.resolved?.displayName) console.log(`    name:      ${described?.name ?? info.resolved?.displayName}`);
+  console.log(`    protocol:  ${protocol === "unknown" ? `UNKNOWN (${npm ?? "no npm package"})` : `${protocol} (${npm})`}`);
+  if (url) console.log(`    endpoint:  ${url}  [${billingFor(url)}]`);
+  if (reasoning !== undefined) {
+    console.log(
+      `    reasoning: ${reasoning ? "on" : "off"}${described?.interleavedField ? `, interleaved via ${described.interleavedField}` : ""} (a model property, so the same in every seat)`,
+    );
+  }
+  console.log(`    source:    ${described ? "opencode models --verbose" : "provider block in your config"}`);
 }
 
 /**
@@ -497,7 +511,22 @@ async function cmdInstall(args: string[]): Promise<void> {
   // with no warning, and the user runs code that predates everything the
   // CLI and README describe. Pinning makes a missing release fail loudly
   // at load time instead of silently running the wrong version.
-  const pkg = await pluginSpec();
+  // `--plugin` overrides the npm spec, typically to load a local build:
+  // `--plugin local` wires in this checkout's dist/index.js.
+  const pluginArg = flagValue(args, "--plugin");
+  let pkg: string;
+  let pluginIsLocal = false;
+  if (pluginArg !== undefined) {
+    const resolved = resolvePluginArg(pluginArg, __dirname);
+    if (!resolved.ok) {
+      console.error(`✗ ${resolved.error}`);
+      process.exit(1);
+    }
+    pkg = resolved.spec;
+    pluginIsLocal = resolved.local;
+  } else {
+    pkg = await pluginSpec();
+  }
 
   // ── 1. Choose the model assignment ────────────────────────────────
   // `--all-seats <id>` and the alias presets short-circuit everything else:
@@ -624,6 +653,14 @@ async function cmdInstall(args: string[]): Promise<void> {
   for (const [role, model] of Object.entries(agents)) {
     console.log(`    ${role.padEnd(28)} ${model}`);
   }
+  if (!pluginIsLocal) {
+    console.log(`\n  Plugin: ${pkg} from npm.`);
+    console.log(`  To load this checkout instead (the fork's metering, repair loop and`);
+    console.log(`  --no-budget are not in any npm release), re-run with --plugin local.`);
+  } else {
+    console.log(`\n  Plugin: local build, ${pkg}`);
+    console.log(`  Rebuild with \`bun run build\` after pulling changes; opencode loads that file.`);
+  }
   if (allSeats) {
     reportSeatPurity(patch, allSeats.modelId);
     console.log(`\n  One more step for a clean single-model baseline:`);
@@ -742,6 +779,10 @@ Install options:
   --all-seats <id>    Assign ONE model to every role the installer writes.
                       Verbatim, no routing, no fall-through. For single-model
                       baselines: opencode-teamwork install --all-seats xiaomi/mimo-v2.6-pro
+  --plugin <spec>     Which build of the plugin opencode loads. 'local' uses this
+                      checkout's dist/index.js; a path or file:// URL uses that
+                      build; anything else is an npm spec. Default: the npm
+                      release matching this CLI's version.
   --preset <name>     Use a preset: ${PRESETS.map((p) => p.name).join(", ")}
                       or 'custom' to set a model per role (needs a terminal)
                       Single-model aliases (model id read from YOUR config):

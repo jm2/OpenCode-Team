@@ -71,3 +71,28 @@ describe("teamwork_plan applies the user's parsed flags", () => {
     expect(out).not.toContain("from your command");
   });
 });
+
+describe("--no-budget reaches the engine in code (fork)", () => {
+  test("without the model passing budgetEnforced", async () => {
+    const project = mkdtempSync(join(tmpdir(), "flags-"));
+    const ptr = await command(project, "--no-budget fix it");
+    const out = await plan(project, { topology: "small-focused" });
+    expect(Engine.resume(runDirFor(project, ptr.sessionId)).budgetEnforced).toBe(false);
+    expect(out).toContain("applied --no-budget from your command");
+  });
+
+  test("over a model that asked to enforce it", async () => {
+    const project = mkdtempSync(join(tmpdir(), "flags-"));
+    const ptr = await command(project, "--no-budget fix it");
+    const out = await plan(project, { topology: "small-focused", budgetEnforced: true });
+    expect(Engine.resume(runDirFor(project, ptr.sessionId)).budgetEnforced).toBe(false);
+    expect(out).toContain("the plan asked to enforce the budget");
+  });
+
+  test("the budget stays enforced when the flag is absent", async () => {
+    const project = mkdtempSync(join(tmpdir(), "flags-"));
+    const ptr = await command(project, "fix it");
+    await plan(project, { topology: "small-focused" });
+    expect(Engine.resume(runDirFor(project, ptr.sessionId)).budgetEnforced).toBe(true);
+  });
+});

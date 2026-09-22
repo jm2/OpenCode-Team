@@ -33,7 +33,7 @@ import { ENGINE_ROLES } from "./guard.js";
 import { DEFAULT_POLICY, TOPOLOGY_NAMES, type Policy } from "./policy.js";
 import { pointerFor, type RunPointer } from "./run-pointer.js";
 import { createWorktreeManager, runDirFor } from "./worktree.js";
-import { ALL_SEATS_ENV, singleModelRouting } from "./cli/all-seats.js";
+import { ALL_SEATS_ENV, singleModelRouting } from "./single-model.js";
 import { repairArtifact, VERIFICATION_REPORT_HINT } from "./repair.js";
 
 // ─── Shared helpers ──────────────────────────────────────────────────
@@ -179,6 +179,7 @@ interface PlanFlags {
   sessionId?: string;
   budgetUsd?: number;
   maxConcurrency?: number;
+  budgetEnforced?: boolean;
 }
 
 /**
@@ -208,6 +209,16 @@ export function applyCommandFlags<A extends PlanFlags>(
   };
   const budgetUsd = pick("--budget", pointer.budgetUsd, args.budgetUsd);
   const maxConcurrency = pick("--concurrency", pointer.maxConcurrency, args.maxConcurrency);
+  // --no-budget is recorded in the pointer as budgetEnforced: false.
+  let budgetEnforced = args.budgetEnforced;
+  if (pointer.budgetEnforced === false) {
+    notes.push(
+      args.budgetEnforced === true
+        ? "applied --no-budget from your command (the plan asked to enforce the budget)"
+        : "applied --no-budget from your command",
+    );
+    budgetEnforced = false;
+  }
   return {
     notes,
     args: {
@@ -216,6 +227,7 @@ export function applyCommandFlags<A extends PlanFlags>(
       sessionId: args.sessionId ?? pointer.sessionId,
       ...(budgetUsd !== undefined ? { budgetUsd } : {}),
       ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+      ...(budgetEnforced !== undefined ? { budgetEnforced } : {}),
     },
   };
 }

@@ -11,6 +11,8 @@
  * "dispatch and don't care which model a role uses" contract is untouched.
  */
 
+import { spawnSync } from "node:child_process";
+
 /**
  * Every role the installer writes a model for.
  *
@@ -186,6 +188,98 @@ export function findConfiguredModels(
   return out;
 }
 
+// ─── What opencode itself says about a model ─────────────────────────
+
+/** One entry from `opencode models <provider> --verbose`. */
+export interface OpencodeModelInfo {
+  id: string;
+  name?: string;
+  /** Wire-protocol package, e.g. "@ai-sdk/openai-compatible". */
+  npm?: string;
+  /** Endpoint the provider is pointed at. */
+  url?: string;
+  reasoning?: boolean;
+  interleavedField?: string;
+  cost?: { input?: number; output?: number };
+}
+
+/**
+ * Parse `opencode models --verbose`: an id line ("provider/model") followed by
+ * a pretty-printed JSON object that ends with "}" in column 0.
+ *
+ * This is the most reliable description of a model available, because it is
+ * what opencode resolved after merging its catalog, the user's config and the
+ * user's credentials — a provider block in opencode.json is only one input.
+ */
+export function parseOpencodeModelsVerbose(text: string): OpencodeModelInfo[] {
+  const out: OpencodeModelInfo[] = [];
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const id = lines[i]!.trim();
+    if (!/^[\w.-]+\/\S+$/.test(id) || lines[i + 1] !== "{") continue;
+    let j = i + 1;
+    while (j < lines.length && lines[j] !== "}") j += 1;
+    try {
+      const m = JSON.parse(lines.slice(i + 1, j + 1).join("\n")) as Record<string, any>;
+      out.push({
+        id,
+        ...(typeof m.name === "string" ? { name: m.name } : {}),
+        ...(typeof m.api?.npm === "string" ? { npm: m.api.npm } : {}),
+        ...(typeof m.api?.url === "string" ? { url: m.api.url } : {}),
+        ...(typeof m.capabilities?.reasoning === "boolean" ? { reasoning: m.capabilities.reasoning } : {}),
+        ...(typeof m.capabilities?.interleaved?.field === "string"
+          ? { interleavedField: m.capabilities.interleaved.field }
+          : {}),
+        ...(m.cost ? { cost: { input: m.cost.input, output: m.cost.output } } : {}),
+      });
+    } catch {
+      // A block that does not parse is skipped, not guessed at.
+    }
+    i = j;
+  }
+  return out;
+}
+
+/**
+ * Ask the installed opencode about one model. Returns null when opencode is
+ * not on PATH, times out, or does not list the model.
+ */
+export function describeWithOpencode(
+  modelId: string,
+  run: (args: string[]) => string | null = runOpencode,
+): OpencodeModelInfo | null {
+  const provider = modelId.split("/")[0];
+  if (!provider) return null;
+  const text = run(["models", provider, "--verbose"]);
+  if (!text) return null;
+  return parseOpencodeModelsVerbose(text).find((m) => m.id === modelId) ?? null;
+}
+
+function runOpencode(args: string[]): string | null {
+  try {
+    const res = spawnSync("opencode", args, { encoding: "utf-8", timeout: 60_000 });
+    return res.status === 0 ? res.stdout : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Token Plan subscriptions use their own hosts; pay-as-you-go does not. */
+export function billingFor(url: string | undefined): "token-plan" | "pay-as-you-go" | "unknown" {
+  if (!url) return "unknown";
+  let host: string;
+  try {
+    host = new URL(url).host;
+  } catch {
+    return "unknown";
+  }
+  if (/token-plan/i.test(host)) return "token-plan";
+  if (host === "api.xiaomimimo.com") return "pay-as-you-go";
+  return "unknown";
+}
+
+// ─── Aliases ─────────────────────────────────────────────────────────
+
 export interface PresetAlias {
   name: string;
   description: string;
@@ -209,23 +303,61 @@ export function findAlias(name: string): PresetAlias | undefined {
   return SINGLE_MODEL_ALIASES.find((a) => a.name === name);
 }
 
+/** Model ids the config itself points at: the default, the small model, and any agent. */
+export function configuredModelRefs(config: Record<string, any>): string[] {
+  const refs: string[] = [];
+  const add = (v: unknown) => {
+    if (typeof v === "string" && v.includes("/") && !refs.includes(v)) refs.push(v);
+  };
+  add(config?.model);
+  add(config?.small_model);
+  for (const agent of Object.values((config?.agent ?? {}) as Record<string, any>)) add(agent?.model);
+  return refs;
+}
+
 /**
  * Resolve an alias against a loaded config. Errors are strings rather than
  * throws so the CLI can print them and exit cleanly.
+ *
+ * First choice is a model the config already uses — its default `model`,
+ * `small_model` or an agent's model. That covers a model from opencode's
+ * built-in catalog, which has no provider block to find. A provider block is
+ * the fallback. Either way the id comes from the user's config, and more than
+ * one candidate is refused rather than picked from.
  */
 export function resolveAlias(
   alias: PresetAlias,
   config: Record<string, any>,
   configPath: string,
 ): { ok: true; model: ResolvedProviderModel } | { ok: false; error: string } {
+  const referenced = configuredModelRefs(config).filter((id) => alias.match.test(id));
+  if (referenced.length === 1) {
+    const id = referenced[0]!;
+    const [providerKey, ...rest] = id.split("/");
+    const fromBlock = findConfiguredModels(config, alias.match).find((m) => m.modelId === id);
+    return {
+      ok: true,
+      model: fromBlock ?? { modelId: id, providerKey: providerKey!, modelKey: rest.join("/") },
+    };
+  }
+  if (referenced.length > 1) {
+    return {
+      ok: false,
+      error:
+        `preset "${alias.name}": ${configPath} uses ${referenced.length} matching models:\n` +
+        referenced.map((m) => `    ${m}`).join("\n") +
+        `\n  Pick one explicitly:\n    opencode-teamwork install --all-seats ${referenced[0]}`,
+    };
+  }
+
   const found = findConfiguredModels(config, alias.match);
   if (found.length === 0) {
     return {
       ok: false,
       error:
-        `preset "${alias.name}" found no matching provider in ${configPath}.\n` +
-        `  It looks for a provider or model matching ${alias.match} under the "provider" key.\n` +
-        `  Configure the provider first, or pass the id directly:\n` +
+        `preset "${alias.name}" found no matching model in ${configPath}.\n` +
+        `  It looks for a model matching ${alias.match} in "model", "small_model", an agent's\n` +
+        `  model, or a "provider" block. Set one of those, or pass the id directly:\n` +
         `    opencode-teamwork install --all-seats <provider>/<model>`,
     };
   }
@@ -244,33 +376,6 @@ export function resolveAlias(
 
 // ─── Single-model routing policy ─────────────────────────────────────
 
-/**
- * A `Policy.routing` map with every ladder pinned to one model.
- *
- * Upstream's `DEFAULT_POLICY.routing` carries Anthropic and Google ladders;
- * `engine.modelFor()` resolves them and `teamwork_dispatch` prints the result
- * to the sentinel as the model to use. That is advisory text rather than a
- * routing decision, but it is still a vendor string recommended into a seat.
- * Pinning every rung removes the escalation, which is the point: a baseline
- * that escalates to a second model is not a single-model baseline.
- *
- * Shaped as plain data so it can be written to `.teamwork/policy.json` or
- * merged by `loadPolicy` from the environment.
- */
-export function singleModelRouting<R extends { ladder: string[] }>(
-  modelId: string,
-  existing?: Record<string, R>,
-): Record<string, R> {
-  const out: Record<string, R> = {};
-  for (const [key, rule] of Object.entries(existing ?? {})) {
-    // One rung. `ladderRung` clamps the index, so every attempt resolves here
-    // and the escalate-on-failure step becomes a no-op. Every other field of
-    // the rule (topology, requiredChecks) is preserved untouched.
-    out[key] = { ...rule, ladder: [modelId] };
-  }
-  if (!out["default"]) out["default"] = { ladder: [modelId] } as R;
-  return out;
-}
-
-/** Environment variable that pins the routing ladders at run time. */
-export const ALL_SEATS_ENV = "TEAMWORK_ALL_SEATS_MODEL";
+// Runtime pieces live in src/single-model.ts so the plugin does not import
+// from the installer's directory. Re-exported here for existing callers.
+export { ALL_SEATS_ENV, singleModelRouting } from "../single-model.js";

@@ -12,8 +12,13 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import {
   allSeatsAgents,
+  billingFor,
+  configuredModelRefs,
+  describeWithOpencode,
+  parseOpencodeModelsVerbose,
   findAlias,
   findConfiguredModels,
   findVendorModelStrings,
@@ -187,7 +192,7 @@ describe("mimo alias resolves from config, never from a hardcoded id", () => {
     const r = resolveAlias(findAlias("mimo")!, { provider: {} }, "cfg.json");
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.error).toContain("found no matching provider");
+    expect(r.error).toContain("found no matching model");
   });
 
   test("refuses rather than picking when several models match", () => {
@@ -249,5 +254,75 @@ describe("loadPolicy honours the single-model pin", () => {
       if (before === undefined) delete process.env.TEAMWORK_ALL_SEATS_MODEL;
       else process.env.TEAMWORK_ALL_SEATS_MODEL = before;
     }
+  });
+});
+
+describe("mimo alias with a catalog model (no provider block)", () => {
+  test("resolves the model the config's default points at", () => {
+    const cfg = { model: MIMO, agent: { build: { model: MIMO } } };
+    const r = resolveAlias(findAlias("mimo")!, cfg, "cfg.json");
+    expect(r.ok && r.model.modelId).toBe(MIMO);
+  });
+
+  test("refuses when the config uses two different matching models", () => {
+    const cfg = { model: MIMO, small_model: "xiaomi/mimo-v2.5" };
+    const r = resolveAlias(findAlias("mimo")!, cfg, "cfg.json");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("uses 2 matching models");
+  });
+
+  test("configuredModelRefs collects default, small and agent models once each", () => {
+    expect(
+      configuredModelRefs({ model: "a/x", small_model: "a/y", agent: { p: { model: "a/x" }, q: { model: "b/z" } } }),
+    ).toEqual(["a/x", "a/y", "b/z"]);
+  });
+});
+
+describe("what opencode says about a model", () => {
+  // Real output of `opencode models xiaomi --verbose` from opencode 1.18.32,
+  // with its bundled catalog (which predates mimo-v2.6-pro).
+  const fixture = readFileSync(
+    new URL("./fixtures/opencode-1.18.32-models-xiaomi-verbose.txt", import.meta.url),
+    "utf-8",
+  );
+
+  test("parses every model block", () => {
+    const models = parseOpencodeModelsVerbose(fixture);
+    expect(models.map((m) => m.id)).toEqual([
+      "xiaomi/mimo-v2.5",
+      "xiaomi/mimo-v2.5-pro",
+      "xiaomi/mimo-v2.5-pro-ultraspeed",
+    ]);
+  });
+
+  test("the built-in xiaomi provider speaks the OpenAI protocol, pay-as-you-go", () => {
+    const pro = parseOpencodeModelsVerbose(fixture).find((m) => m.id === "xiaomi/mimo-v2.5-pro")!;
+    expect(pro.npm).toBe("@ai-sdk/openai-compatible");
+    expect(protocolFor(pro.npm)).toBe("openai");
+    expect(pro.url).toBe("https://api.xiaomimimo.com/v1");
+    expect(billingFor(pro.url)).toBe("pay-as-you-go");
+    expect(pro.reasoning).toBe(true);
+    expect(pro.interleavedField).toBe("reasoning_content");
+  });
+
+  test("Token Plan endpoints are told apart by host", () => {
+    expect(billingFor("https://token-plan-sgp.xiaomimimo.com/v1")).toBe("token-plan");
+    expect(billingFor("https://gateway.example.invalid/v1")).toBe("unknown");
+    expect(billingFor(undefined)).toBe("unknown");
+  });
+
+  test("describeWithOpencode asks for the model's provider and picks the model", () => {
+    const calls: string[][] = [];
+    const info = describeWithOpencode("xiaomi/mimo-v2.5", (args) => {
+      calls.push(args);
+      return fixture;
+    });
+    expect(calls).toEqual([["models", "xiaomi", "--verbose"]]);
+    expect(info?.id).toBe("xiaomi/mimo-v2.5");
+  });
+
+  test("returns null rather than guessing when opencode is unavailable or silent", () => {
+    expect(describeWithOpencode(MIMO, () => null)).toBeNull();
+    expect(describeWithOpencode(MIMO, () => fixture)).toBeNull(); // not in the bundled catalog
   });
 });
