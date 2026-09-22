@@ -382,6 +382,31 @@ Also corrected while in there: `teamwork_plan` used to print
 `budget: $20.00 (halt at 80%)`, which states the behaviour the feature table
 gets wrong. It now says it warns at 80% and refuses dispatch at 100%.
 
+## 8b. Upstream-friendly fixes, split out for separate PRs
+
+Eight defects found during this audit are ordinary upstream bugs with nothing
+to do with a single-model baseline. Each sits on its own branch cut from
+`main`, one commit, tests included, `bun run verify` green, so they can go
+upstream independently of the experiment work.
+
+| Branch | Defect |
+|---|---|
+| `fix/worktree-branch-collision` | `agentBranch` used `sessionId.slice(0, 8)`, which for minted ISO-timestamp ids is the year and month. Two runs in a month that share an agent name collide on one branch: the second gets no worktree and its worker edits the main checkout. `cleanupSession` globbed the same prefix and force-deleted other runs' branches. |
+| `fix/guard-task-permission` | All eight leaf roles declare `permission.task: deny`, and the README promises "a worker cannot fan out its own swarm". The runtime guard only ever enforced `permission.edit`, so that promise had no second line behind it. |
+| `fix/event-log-partial-write` | A partial final line in `events.jsonl` made every reader throw, including `teamwork_resume`, whose job is to report a damaged log. `Engine.resume` also parsed `plan.dag.json` with no catch. |
+| `fix/event-log-stale-tip-cache` | The cached log tip was never invalidated and outranked the file, so an externally changed log led `appendEvent` to write a duplicate `seq` and a stale `prevHash`, breaking the chain. |
+| `fix/policy-parse-silent-fallback` | `loadPolicy` swallowed parse errors, silently reverting to the default ladders and dropping declared `requiredChecks`, including `adversarial:privilege-escalation` on the auth-change route. |
+| `fix/cli-preset-menu` | Two off-by-ones left both `custom` and `skip` unpickable. The out-of-range message named the very number it had just refused. |
+| `fix/cost-artifacts-never-written` | Agent prompts require `cost.json`, describe `costs.json` and `verify/summary.json` that no run writes, and tell the sentinel to own `state.json`, which `src/state.ts` says must never be model-authored. Also fixes `estimateCost` pricing unknown models off Claude Sonnet's card. |
+| `fix/budget-halt-message` | `teamwork_plan` told the sentinel "budget: $X (halt at 80%)". Nothing halts at 80%. |
+
+Three of these overlap this fork's own edits and will need attention when the
+fork rebases: `fix/event-log-partial-write` and `fix/policy-parse-silent-fallback`
+and `fix/budget-halt-message` all touch `src/tools.ts`, and the last also
+touches the budget messaging this fork rewrote in §11. `fix/cli-preset-menu`
+touches `src/cli/index.ts` near the `--all-seats` wiring. Taking the upstream
+versions first and re-applying §9's list on top is the cleaner order.
+
 ## 9. What changed in this fork
 
 Additive files, to keep the fork rebaseable:
