@@ -96,8 +96,19 @@ function baseBranch(sessionId: string): string {
   return `teamwork/base-${sessionId}`;
 }
 
+/**
+ * Namespace holding one run's agent branches: `teamwork/run/<sessionId>/`.
+ *
+ * The session id is its own path component. Neither a session id nor an agent
+ * name may contain `/`, so a branch name maps back to exactly one
+ * (session, agent) pair and cleanup can select one run's branches by prefix.
+ */
+function agentBranchPrefix(sessionId: string): string {
+  return `teamwork/run/${sessionId}/`;
+}
+
 function agentBranch(agentName: string, sessionId: string): string {
-  return `teamwork/agent-${agentName}-${sessionId.slice(0, 8)}`;
+  return `${agentBranchPrefix(sessionId)}agent-${agentName}`;
 }
 
 function worktreesRoot(cwd: string, sessionId: string): string {
@@ -194,7 +205,12 @@ export function createWorktreeManager(): WorktreeManager {
       // `git worktree remove` against the *parent* directory (never a
       // worktree), swallowed the failure, then rmSync'd directories git still
       // had registered — leaving stale worktree metadata behind.
-      for (const info of this.list(sessionId, { cwd })) {
+      //
+      // Note the branches first: git reports each worktree's branch exactly,
+      // which also covers branches named by earlier versions of this module.
+      const worktrees = this.list(sessionId, { cwd });
+      const owned = new Set(worktrees.map((info) => info.branch));
+      for (const info of worktrees) {
         git(["worktree", "remove", "--force", info.path], cwd);
       }
       if (existsSync(root)) {
@@ -204,22 +220,24 @@ export function createWorktreeManager(): WorktreeManager {
         }
         rmSync(root, { recursive: true, force: true });
       }
-      // Delete session branches, then prune. Branch names come from git, not
-      // from a shell expansion (the old code used $(...) which is a no-op on
-      // Windows and unquoted elsewhere).
-      const suffix = sessionId.slice(0, 8);
-      const branches = git(["branch", "--list", `teamwork/*-${suffix}`], cwd);
+      // Delete this run's branches, then prune. Branch names come from git,
+      // not from a shell expansion (the old code used $(...) which is a no-op
+      // on Windows and unquoted elsewhere).
+      //
+      // Selected by this run's namespace, plus whatever its worktrees were on.
+      // The old pattern, `teamwork/*-${sessionId.slice(0, 8)}`, read
+      // `teamwork/*-2026-09-` for every run in the same month, so tearing down
+      // one run force-deleted other runs' agent branches.
+      const branches = git(["branch", "--list", `${agentBranchPrefix(sessionId)}*`], cwd);
       if (branches.ok) {
         for (const line of branches.stdout.split("\n")) {
-          const name = line.replace(/^\*?\s*/, "").trim();
-          if (!name) continue;
-          git(["branch", "-D", name], cwd);
+          const name = line.replace(/^[*+]?\s*/, "").trim();
+          if (name) owned.add(name);
         }
       }
       const base = baseBranch(sessionId);
-      if (git(["rev-parse", "--verify", base], cwd).ok) {
-        git(["branch", "-D", base], cwd);
-      }
+      if (git(["rev-parse", "--verify", base], cwd).ok) owned.add(base);
+      for (const name of owned) git(["branch", "-D", name], cwd);
       git(["worktree", "prune"], cwd);
     },
 
@@ -229,7 +247,10 @@ export function createWorktreeManager(): WorktreeManager {
       const out = git(["worktree", "list", "--porcelain"], cwd);
       const results: WorktreeInfo[] = [];
       if (!out.ok) return results;
-      const prefix = sessionDir(sessionId).split(sep).join("/");
+      // Trailing slash: without it, the worktrees of session "run10" matched
+      // session "run1", and cleaning up run1 force-removed run10's worktrees
+      // along with any uncommitted work in them.
+      const prefix = `${sessionDir(sessionId).split(sep).join("/")}/`;
       for (const block of out.stdout.split(/\r?\n\r?\n/)) {
         const lines = block.split(/\r?\n/);
         const pathLine = lines.find((l) => l.startsWith("worktree "));
