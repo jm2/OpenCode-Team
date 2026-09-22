@@ -220,23 +220,29 @@ async function pickMenu(
     choices.forEach((c, i) => {
       console.log(`  ${(i + 1).toString().padStart(2)}. ${c.label.padEnd(20)} ${c.description}`);
     });
+    // The skip entry is numbered right after the choices, and that same
+    // number is what gets accepted. These used to disagree: skip was printed
+    // as choices.length + 1 but only choices.length + 2 was accepted, so the
+    // option could not be picked and the out-of-range message named the very
+    // number it had just rejected.
+    const skipIndex = options.skipChoice ? choices.length + 1 : null;
     if (options.skipChoice) {
-      console.log(`  ${(choices.length + 1).toString().padStart(2)}. ${options.skipChoice.padEnd(20)} keep your existing config`);
+      console.log(`  ${skipIndex!.toString().padStart(2)}. ${options.skipChoice.padEnd(20)} keep your existing config`);
     }
-    const quitHint = options.skipChoice ? choices.length + 2 : choices.length + 1;
+    const maxChoice = skipIndex ?? choices.length;
     console.log(`   q. quit                            cancel and exit\n`);
 
     for (;;) {
-      const raw = (await rl.question(`  > choice (1-${quitHint}, q=quit): `)).trim().toLowerCase();
+      const raw = (await rl.question(`  > choice (1-${maxChoice}, q=quit): `)).trim().toLowerCase();
       if (raw === "q" || raw === "quit" || raw === "exit") throw new AbortError();
       const idx = Number.parseInt(raw, 10);
       if (Number.isNaN(idx)) {
         console.log(`  Please enter a number or 'q' to quit.`);
         continue;
       }
-      if (idx === quitHint && options.skipChoice) return null;
+      if (skipIndex !== null && idx === skipIndex) return null;
       if (idx < 1 || idx > choices.length) {
-        console.log(`  Out of range. Pick 1-${choices.length}${options.skipChoice ? `, ${choices.length + 1} to skip, or q to quit` : ` or q to quit`}.`);
+        console.log(`  Out of range. Pick 1-${choices.length}${skipIndex !== null ? `, ${skipIndex} to skip, or q to quit` : ` or q to quit`}.`);
         continue;
       }
       return idx - 1;
@@ -275,13 +281,19 @@ async function askText(
 /** Top-level preset picker. Returns the chosen preset name, or
  *  null for "skip" (keep existing config), or "custom" for per-role. */
 async function pickPreset(): Promise<string | null> {
-  const idx = await pickMenu(
-    "Choose a preset for opencode-teamwork:",
-    PRESETS.map((p) => ({ label: p.name, description: p.description })),
-    { skipChoice: "skip" },
-  );
+  // "custom" has to be a real entry in the list. `pickMenu` returns an index
+  // in [0, choices.length) or null for skip, so the old
+  // `idx === PRESETS.length` test could never fire and the per-role picker
+  // was unreachable from the menu.
+  const choices = [
+    ...PRESETS.map((p) => ({ label: p.name, description: p.description })),
+    { label: "custom", description: "Choose the model for each role yourself." },
+  ];
+  const idx = await pickMenu("Choose a preset for opencode-teamwork:", choices, {
+    skipChoice: "skip",
+  });
   if (idx === null) return null;
-  if (idx === PRESETS.length) return "custom";
+  if (idx === choices.length - 1) return "custom";
   return PRESETS[idx]!.name;
 }
 
@@ -377,11 +389,18 @@ async function cmdInstall(args: string[]): Promise<void> {
   // ── 1. Choose the model assignment ────────────────────────────────
   let agents: Record<string, string>;
   try {
-    if (presetName) {
+    if (presetName === "custom") {
+      if (!isTTY || autoYes) {
+        console.error(`✗ --preset custom asks for a model per role and needs an interactive terminal.`);
+        console.error(`  Non-interactively, pick a named preset: ${PRESETS.map((p) => p.name).join(", ")}`);
+        process.exit(1);
+      }
+      agents = await pickPerRoleModels();
+    } else if (presetName) {
       const preset = PRESETS.find((p) => p.name === presetName);
       if (!preset) {
         console.error(`✗ Unknown preset: ${presetName}`);
-        console.error(`  Available: ${PRESETS.map((p) => p.name).join(", ")}`);
+        console.error(`  Available: ${PRESETS.map((p) => p.name).join(", ")}, custom`);
         process.exit(1);
       }
       console.log(`\n  Preset: ${preset.name} — ${preset.description}`);
@@ -577,7 +596,8 @@ Usage:
   opencode-teamwork --version
 
 Install options:
-  --preset <name>     Use a preset: ${PRESETS.map((p) => p.name).join(", ")}, or 'custom' for per-role
+  --preset <name>     Use a preset: ${PRESETS.map((p) => p.name).join(", ")}
+                      or 'custom' to set a model per role (needs a terminal)
   --reset             Overwrite the existing config (no merge; warns + confirms)
   --dry-run           Print the config that would be written, then exit
   --print             Alias for --dry-run
