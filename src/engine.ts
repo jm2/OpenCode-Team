@@ -120,6 +120,8 @@ export interface RoundOutcome {
   /** Included when the report was rejected as evidence-free. */
   rejection?: string;
   nextModel?: string;
+  /** Tasks parked because this one was dead-lettered and they depend on it. */
+  parkedDependents?: string[];
 }
 
 export interface StatusSummary {
@@ -739,6 +741,7 @@ export class Engine {
 
     let status: TaskStatus;
     let reason: string | undefined;
+    let parkedDependents: string[] = [];
     if (input.report.status === "PASS") {
       status = "COMPLETED";
       appendEvent(this.runDir, {
@@ -758,6 +761,7 @@ export class Engine {
         ts: this.now(),
         data: { attempt, maxRounds, reason },
       });
+      parkedDependents = this.parkDependents(input.taskId);
     } else {
       status = "PENDING";
       reason = `round ${attempt}/${maxRounds} failed — re-dispatch`;
@@ -809,7 +813,40 @@ export class Engine {
       maxRounds,
       ...(reason ? { reason } : {}),
       ...(status === "PENDING" ? { nextModel: this.modelFor(input.taskId, attempt) } : {}),
+      ...(parkedDependents.length > 0 ? { parkedDependents } : {}),
     };
+  }
+
+  /**
+   * Dead-letter every task that can no longer run because something it
+   * depends on, directly or transitively, will never complete.
+   *
+   * Without this, a dead-lettered task's dependents stayed PENDING forever:
+   * nothing was dispatchable, haltReason() found no reason to stop, the run
+   * never reached session.done, and the sentinel was told they were
+   * "waiting on dependencies".
+   */
+  private parkDependents(taskId: string): string[] {
+    const before = deriveSession(this.events());
+    const parked: string[] = [];
+    const queue = [taskId];
+    while (queue.length > 0) {
+      const gone = queue.shift()!;
+      for (const t of this.tasks) {
+        if (!(t.dependsOn ?? []).includes(gone) || parked.includes(t.taskId)) continue;
+        if ((before.tasks[t.taskId]?.status ?? "PENDING") !== "PENDING") continue;
+        appendEvent(this.runDir, {
+          type: "task.deadletter",
+          sessionId: this.sessionId,
+          taskId: t.taskId,
+          ts: this.now(),
+          data: { reason: `dependency ${gone} will not complete`, dependency: gone },
+        });
+        parked.push(t.taskId);
+        queue.push(t.taskId);
+      }
+    }
+    return parked;
   }
 
   /** Park every remaining dispatchable task (user stop, unrecoverable error). */

@@ -652,6 +652,9 @@ export const teamworkVerify: ToolDefinition = tool({
       head,
       recovered.trimEnd(),
       outcome.nextModel ? `  next attempt escalates to: ${outcome.nextModel}` : "",
+      outcome.parkedDependents
+        ? `  also dead-lettered, because they depend on it: ${outcome.parkedDependents.join(", ")}`
+        : "",
       outcome.status === "PENDING" ? `  feed the verifier's feedback back to a fresh worker` : "",
       "",
       statusLine(engine),
