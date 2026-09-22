@@ -1,5 +1,29 @@
 # Ground truth: what `opencode-teamwork` actually implements
 
+> **Status (review pass, in progress).** Parts of this document predate a
+> later review and are superseded; the full rewrite has not been done yet.
+> Until it is, the commit log on this branch is authoritative. Known changes:
+>
+> - **The plugin never loaded on current opencode.** opencode 1.18.32 rejects
+>   the entry module ("Plugin export is not a function"), for both npm 0.2.1
+>   and this repo; fixed on `fix/plugin-entry-exports`. npm's only release,
+>   0.2.1, also lacks the whole engine this document describes.
+> - **§7.2 protocol, no longer unverified:** opencode's bundled catalog maps
+>   the `xiaomi` provider to `@ai-sdk/openai-compatible` at
+>   `api.xiaomimimo.com` (OpenAI protocol, pay-as-you-go). Token Plans are
+>   separate `xiaomi-token-plan-*` providers. `opencode models xiaomi
+>   --verbose` confirms it for your install.
+> - **§3 / §11:** `--budget` and `--no-budget` did not reach the engine in
+>   code; `teamwork_plan` now applies them itself. The budget is enforced
+>   against cost metered from opencode's own records (`usage.jsonl`,
+>   `costs.json`), not the sentinel's self-report.
+> - **§8b:** the policy-fallback claim about privilege-escalation checks was
+>   overstated. There are now 17 `fix/*` branches, not 8.
+> - **Phase 2 repair loop:** exhaustion now fails the task instead of wedging
+>   the run; raw evidence is no longer overwritten across rounds.
+> - **Phase 3 smoke test:** rewritten on recorded evidence; verified against
+>   real opencode with a scripted fake provider.
+
 Audit of the code at `281821a` (v0.3.0), written for a single-model baseline
 experiment. Everything below was read out of `src/`, and the behavioural claims
 were executed, not inferred. Where the README and the code disagree, the code

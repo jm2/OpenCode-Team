@@ -1,60 +1,63 @@
 #!/usr/bin/env bash
 #
-# smoke-delegation.sh — run this BEFORE any orchestration.
+# smoke-delegation.sh — run this BEFORE any orchestration run.
 #
-# There is a known opencode failure mode where a model works fine as the
-# primary agent but returns HTTP 400 when invoked as a subagent through the
-# task tool, leaving the parent with an empty response. A teamwork run is
-# nothing but nested subagent calls, so that failure turns into a silent
-# dead run rather than an error you can read.
+# A teamwork run is nested subagent calls over one provider. This proves, with
+# evidence recorded by opencode itself rather than anything a model says:
 #
-# This script proves, in order:
-#   A. the configured model answers as the primary agent;
-#   B. it calls tools as the primary agent;
-#   C. it answers when invoked as a SUBAGENT through the task tool;
-#   D. one full round-trip through the plugin's own dispatch path
-#      (teamwork_plan -> teamwork_dispatch -> teamwork_verify), asserted
-#      against the event log on disk rather than against what a model says.
+#   A. the model answers as the PRIMARY agent;
+#   B. it CALLS TOOLS (checked against a file on disk);
+#   C. it answers as a SUBAGENT through the task tool. The plugin records
+#      every model call with its session's parent, so a subagent reply is a
+#      recorded child-session call, and a provider rejection is recorded with
+#      its HTTP status and response body. A parent that invents an answer, or
+#      a client that echoes the prompt, cannot pass this;
+#   D. one full round trip through the plugin's own engine via /teamwork,
+#      checked against the event log, with usage metered into the run and
+#      every model call on the expected model.
 #
-# Everything runs over whichever wire protocol your provider is configured
-# for. The script reports which one it exercised, because a subagent
-# round-trip that passes on OpenAI's protocol is not evidence for
-# Anthropic's, and vice versa.
+# It also reports which wire protocol, endpoint and billing mode the model is
+# configured for, as opencode resolves them (`opencode models --verbose`).
 #
-# Exit codes: 0 all checks passed. 1 a check failed. 2 could not run
-# (missing binary, missing config, unresolved model) — never confused with
-# a pass.
+# Requires this fork's plugin to be the one opencode loads:
+#   opencode-teamwork install --all-seats <provider/model> --plugin local
+# The checks spend a few small requests against your provider and create a
+# few sessions in your opencode history.
+#
+# Exit codes: 0 every check passed; 1 a check failed; 2 could not run
+# (setup problem) — never confused with a pass.
 #
 # Usage:
-#   scripts/smoke-delegation.sh
-#   scripts/smoke-delegation.sh --model xiaomi/mimo-v2.6-pro
-#   scripts/smoke-delegation.sh --config /path/to/opencode.json
-#   scripts/smoke-delegation.sh --timeout 180 --keep
+#   scripts/smoke-delegation.sh [--model provider/model] [--config path]
+#                               [--timeout seconds] [--skip-dispatch] [--keep]
 
 set -euo pipefail
 
 MODEL=""
 CONFIG=""
-TIMEOUT=120
+TIMEOUT=300
 KEEP=0
 SKIP_DISPATCH=0
 
-die_setup() { printf '\n\033[31m✗ cannot run:\033[0m %s\n' "$1" >&2; exit 2; }
-die_fail()  { printf '\n\033[31m✗ FAILED:\033[0m %s\n' "$1" >&2; exit 1; }
-info()      { printf '  %s\n' "$1"; }
-ok()        { printf '  \033[32m✓\033[0m %s\n' "$1"; }
-head_()     { printf '\n\033[1m%s\033[0m\n' "$1"; }
+red()  { printf '\033[31m%s\033[0m' "$1"; }
+green(){ printf '\033[32m%s\033[0m' "$1"; }
+yellow(){ printf '\033[33m%s\033[0m' "$1"; }
+die_setup() { printf '\n%s %s\n' "$(red '✗ cannot run:')" "$1" >&2; exit 2; }
+ok()   { printf '  %s %s\n' "$(green '✓')" "$1"; }
+warn() { printf '  %s %s\n' "$(yellow '!')" "$1"; }
+info() { printf '    %s\n' "$1"; }
+head_(){ printf '\n\033[1m%s\033[0m\n' "$1"; }
+FAILURES=0
+fail() { FAILURES=$((FAILURES + 1)); printf '  %s %s\n' "$(red '✗')" "$1" >&2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --model)   MODEL="${2:-}"; shift 2 ;;
-    --config)  CONFIG="${2:-}"; shift 2 ;;
+    --model) MODEL="${2:-}"; shift 2 ;;
+    --config) CONFIG="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT="${2:-}"; shift 2 ;;
-    --keep)    KEEP=1; shift ;;
     --skip-dispatch) SKIP_DISPATCH=1; shift ;;
-    -h|--help)
-      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
-      exit 0 ;;
+    --keep) KEEP=1; shift ;;
+    -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die_setup "unknown argument: $1" ;;
   esac
 done
@@ -62,292 +65,274 @@ done
 # ─── Preflight ───────────────────────────────────────────────────────
 
 head_ "Preflight"
-
-command -v opencode >/dev/null 2>&1 \
-  || die_setup "the 'opencode' CLI is not on PATH. This script drives the real
-   provider through the real client; there is no way to test delegation
-   without it."
-ok "opencode found: $(command -v opencode)"
+command -v opencode >/dev/null 2>&1 || die_setup "the 'opencode' CLI is not on PATH."
+ok "opencode $(opencode --version 2>/dev/null | head -1) at $(command -v opencode)"
 
 RUNTIME=""
-for candidate in node bun; do
-  if command -v "$candidate" >/dev/null 2>&1; then RUNTIME="$candidate"; break; fi
-done
-[ -n "$RUNTIME" ] || die_setup "need node or bun on PATH to read opencode.json"
-
-if [ -z "$CONFIG" ]; then
-  CONFIG="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}/opencode.json"
-fi
-[ -f "$CONFIG" ] || die_setup "no opencode config at $CONFIG (override with --config)"
-ok "config: $CONFIG"
-
-# Resolve the model and, crucially, the provider's wire protocol. The
-# protocol comes from the provider's npm package, not from the model entry.
-RESOLVED="$("$RUNTIME" -e '
-  const fs = require("node:fs");
-  const raw = fs.readFileSync(process.argv[1], "utf-8")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/^\s*\/\/.*$/gm, "");
-  let cfg; try { cfg = JSON.parse(raw); } catch (e) {
-    console.error("PARSE_ERROR " + e.message); process.exit(3);
-  }
-  const want = process.argv[2] || "";
-  const rows = [];
-  for (const [pk, p] of Object.entries(cfg.provider ?? {})) {
-    for (const mk of Object.keys(p?.models ?? {})) {
-      rows.push({
-        id: pk + "/" + mk,
-        npm: p.npm ?? "",
-        baseURL: p?.options?.baseURL ?? "",
-        name: p.models[mk]?.name ?? "",
-        reasoning: p.models[mk]?.reasoning,
-      });
-    }
-  }
-  let hit;
-  if (want) hit = rows.find((r) => r.id === want);
-  else {
-    // No --model: fall back to what the seats are actually set to, so the
-    // script tests the configuration rather than a guess.
-    const seats = Object.entries(cfg.agent ?? {})
-      .filter(([k]) => k.startsWith("team/"))
-      .map(([, v]) => v?.model)
-      .filter(Boolean);
-    const uniq = [...new Set(seats)];
-    if (uniq.length === 1) hit = rows.find((r) => r.id === uniq[0]) ?? { id: uniq[0], npm: "", baseURL: "", name: "" };
-    else if (uniq.length > 1) { console.error("MIXED_SEATS " + uniq.join(",")); process.exit(4); }
-    else { console.error("NO_SEATS"); process.exit(5); }
-  }
-  if (!hit) { console.error("NOT_FOUND"); process.exit(6); }
-  const npm = (hit.npm || "").toLowerCase();
-  const protocol = npm.includes("anthropic") ? "anthropic"
-                 : npm.includes("openai") ? "openai" : "unknown";
-  console.log([hit.id, protocol, hit.npm, hit.baseURL, hit.name, String(hit.reasoning)].join("\t"));
-' "$CONFIG" "$MODEL" 2>&1)" || {
-  case "$RESOLVED" in
-    MIXED_SEATS*) die_setup "the team/* seats are NOT all on one model:
-   ${RESOLVED#MIXED_SEATS }
-   This is a single-model baseline; fix it first:
-     opencode-teamwork install --all-seats <provider>/<model>" ;;
-    NO_SEATS*) die_setup "no team/* agents in $CONFIG. Run the installer first:
-     opencode-teamwork install --all-seats <provider>/<model>" ;;
-    NOT_FOUND*) die_setup "model '$MODEL' is not defined in $CONFIG" ;;
-    PARSE_ERROR*) die_setup "could not parse $CONFIG — ${RESOLVED#PARSE_ERROR }" ;;
-    *) die_setup "could not resolve a model from $CONFIG: $RESOLVED" ;;
-  esac
-}
-
-MODEL_ID="$(printf '%s' "$RESOLVED" | cut -f1)"
-PROTOCOL="$(printf '%s' "$RESOLVED" | cut -f2)"
-NPM_PKG="$(printf '%s' "$RESOLVED" | cut -f3)"
-BASE_URL="$(printf '%s' "$RESOLVED" | cut -f4)"
-DISPLAY="$(printf '%s' "$RESOLVED" | cut -f5)"
-REASONING="$(printf '%s' "$RESOLVED" | cut -f6)"
-
-ok "model:     $MODEL_ID${DISPLAY:+  ($DISPLAY)}"
-info "provider:  ${NPM_PKG:-<unset>}"
-info "baseURL:   ${BASE_URL:-<unset>}"
-info "reasoning: ${REASONING:-<unset>}"
-
-if [ "$PROTOCOL" = "unknown" ]; then
-  printf '  \033[33m!\033[0m protocol: UNKNOWN from npm package "%s".\n' "${NPM_PKG:-<unset>}"
-  info "  Checks below still run, but this script cannot tell you which"
-  info "  protocol they exercised. Identify it before trusting the result."
-else
-  ok "protocol:  $PROTOCOL  (all checks below exercise this wire protocol)"
-fi
+for c in node bun; do command -v "$c" >/dev/null 2>&1 && { RUNTIME="$c"; break; }; done
+[ -n "$RUNTIME" ] || die_setup "need node or bun on PATH"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/teamwork-smoke.XXXXXX")"
-cleanup() {
-  if [ "$KEEP" -eq 1 ]; then
-    printf '\n  transcripts kept in %s\n' "$WORKDIR"
-  else
-    rm -rf "$WORKDIR"
-  fi
-}
+cleanup() { if [ "$KEEP" -eq 1 ]; then printf '\n  transcripts kept in %s\n' "$WORKDIR"; else rm -rf "$WORKDIR"; fi; }
 trap cleanup EXIT
 
-# Run opencode non-interactively, capturing everything. Never let a hung
-# request masquerade as a pass.
-run_opencode() {
-  local label="$1"; shift
-  local logfile="$WORKDIR/$label.log"
+# One helper for everything that parses JSON. Written out so the script
+# stays a single file.
+HELPER="$WORKDIR/helper.mjs"
+cat > "$HELPER" <<'JS'
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+const [cmd, ...a] = process.argv.slice(2);
+
+// JSONC: strip comments and trailing commas outside strings only.
+function jsonc(t) {
+  let o = "", i = 0;
+  while (i < t.length) {
+    const c = t[i];
+    if (c === '"') { let j = i + 1; while (j < t.length && t[j] !== '"') j += t[j] === "\\" ? 2 : 1; o += t.slice(i, j + 1); i = j + 1; continue; }
+    if (c === "/" && t[i + 1] === "/") { while (i < t.length && t[i] !== "\n") i++; continue; }
+    if (c === "/" && t[i + 1] === "*") { const e = t.indexOf("*/", i + 2); i = e < 0 ? t.length : e + 2; continue; }
+    if (c === ",") { let k = i + 1; while (k < t.length && /\s/.test(t[k])) k++; if (t[k] === "}" || t[k] === "]") { i++; continue; } }
+    o += c; i++;
+  }
+  return JSON.parse(o);
+}
+const lines = (p) => existsSync(p) ? readFileSync(p, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) : [];
+
+if (cmd === "config") {
+  // a: [explicit config path, explicit model]
+  const [explicit, wantModel] = a;
+  const base = process.env.OPENCODE_CONFIG_DIR || join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode");
+  const candidates = explicit ? [explicit] : [process.env.OPENCODE_CONFIG, join(base, "opencode.json"), join(base, "opencode.jsonc")].filter(Boolean);
+  const path = candidates.find((p) => existsSync(p));
+  if (!path) { console.log(`ERROR\tno opencode config found (looked at: ${candidates.join(", ")})`); process.exit(0); }
+  let cfg; try { cfg = jsonc(readFileSync(path, "utf8")); } catch (e) { console.log(`ERROR\tcannot parse ${path}: ${e.message}`); process.exit(0); }
+  const seats = [...new Set(Object.entries(cfg.agent ?? {}).filter(([k]) => k.startsWith("team/")).map(([, v]) => v?.model).filter(Boolean))];
+  let model = wantModel;
+  if (!model) {
+    if (seats.length > 1) { console.log(`ERROR\tthe team/* seats are not all on one model: ${seats.join(", ")}`); process.exit(0); }
+    model = seats[0] || cfg.model;
+  }
+  if (!model) { console.log(`ERROR\tno model: pass --model, or install with --all-seats`); process.exit(0); }
+  const isTeamwork = (p) => {
+    if (typeof p !== "string") return false;
+    if (p === "opencode-teamwork" || p.startsWith("opencode-teamwork@")) return true;
+    if (!p.startsWith("file://")) return false;
+    let d = dirname(fileURLToPath(p));
+    for (let i = 0; i < 8; i++) { const pj = join(d, "package.json"); if (existsSync(pj)) { try { if (JSON.parse(readFileSync(pj, "utf8")).name === "opencode-teamwork") return true; } catch {} } const up = dirname(d); if (up === d) break; d = up; }
+    return false;
+  };
+  const plugins = (Array.isArray(cfg.plugin) ? cfg.plugin : []).filter(isTeamwork);
+  console.log(["OK", path, model, plugins.join(" ") || "-", seats.length === 1 ? "pinned" : "unpinned"].join("\t"));
+} else if (cmd === "describe") {
+  // stdin: `opencode models <provider> --verbose`; a: [model]
+  const text = readFileSync(0, "utf8").split(/\r?\n/);
+  for (let i = 0; i < text.length; i++) {
+    if (text[i].trim() !== a[0] || text[i + 1] !== "{") continue;
+    let j = i + 1; while (j < text.length && text[j] !== "}") j++;
+    const m = JSON.parse(text.slice(i + 1, j + 1).join("\n"));
+    const url = m.api?.url ?? "";
+    const npm = m.api?.npm ?? "";
+    const host = (() => { try { return new URL(url).host; } catch { return ""; } })();
+    const protocol = /anthropic/i.test(npm) ? "anthropic" : /openai/i.test(npm) ? "openai" : "unknown";
+    const billing = /token-plan/i.test(host) ? "token-plan" : host === "api.xiaomimimo.com" ? "pay-as-you-go" : "unknown";
+    console.log(["OK", protocol, npm || "-", url || "-", billing, String(m.capabilities?.reasoning ?? "?"), m.capabilities?.interleaved?.field ?? "-"].join("\t"));
+    process.exit(0);
+  }
+  console.log("MISSING");
+} else if (cmd === "texts") {
+  // a: [json events file] -> the assistant's own text, joined
+  console.log(lines(a[0]).filter((e) => e.type === "text").map((e) => e.part?.text ?? "").join("\n"));
+} else if (cmd === "tele") {
+  // a: [telemetry file, skip-count, filter: primary|sub|all]
+  const recs = lines(a[0]).slice(Number(a[1]));
+  const internal = ["title", "summary", "compaction"];
+  const pick = recs.filter((r) => !internal.includes(r.agent)).filter((r) => a[2] === "primary" ? !r.parentSessionID : a[2] === "sub" ? !!r.parentSessionID : true);
+  for (const r of pick) {
+    const e = r.error;
+    console.log([r.agent, r.model, r.tokens?.output ?? 0, r.tokens?.reasoning ?? 0, r.finish ?? "-",
+      e ? `${e.name}${e.statusCode ? " " + e.statusCode : ""}: ${(e.message ?? "").replace(/\s+/g, " ")}` : "-",
+      e?.responseBody ? e.responseBody.replace(/\s+/g, " ").slice(0, 300) : "-"].join("\t"));
+  }
+} else if (cmd === "count") {
+  console.log(lines(a[0]).length);
+} else if (cmd === "run") {
+  // a: [project dir] -> event types, usage models, starting budget
+  const base = join(a[0], ".opencode", "teamwork");
+  const dirs = existsSync(base) ? (await import("node:fs")).readdirSync(base).map((d) => join(base, d)).filter((d) => existsSync(join(d, "events.jsonl"))) : [];
+  if (dirs.length === 0) { console.log("NONE"); process.exit(0); }
+  const d = dirs[0];
+  const ev = lines(join(d, "events.jsonl"));
+  const us = lines(join(d, "usage.jsonl"));
+  console.log([d, [...new Set(ev.map((e) => e.type))].join(","), us.length, [...new Set(us.filter((u) => !["title","summary","compaction"].includes(u.agent)).map((u) => u.model))].join(","), ev.find((e) => e.type === "session.start")?.data?.budgetUsd ?? "-"].join("\t"));
+}
+JS
+
+IFS=$'\t' read -r STATUS CFG_PATH_OR_ERR RESOLVED_MODEL PLUGINS SEATS <<EOF
+$("$RUNTIME" "$HELPER" config "$CONFIG" "$MODEL")
+EOF
+[ "$STATUS" = "OK" ] || die_setup "$CFG_PATH_OR_ERR"
+MODEL="$RESOLVED_MODEL"
+ok "config: $CFG_PATH_OR_ERR"
+ok "model:  $MODEL$([ "$SEATS" = pinned ] && printf ' (every team/* seat)' || printf ' (team/* seats not all set — the default model)')"
+
+case "$PLUGINS" in
+  -) die_setup "opencode-teamwork is not in the config's plugin list. Install it:
+     opencode-teamwork install --all-seats $MODEL --plugin local" ;;
+  file://*) ok "plugin: $PLUGINS" ;;
+  *) warn "plugin: $PLUGINS from npm. No npm release has this fork's metering, so checks"
+     info "C and D will fail on missing telemetry. Use --plugin local when installing." ;;
+esac
+
+# Portable timeout: GNU timeout, Homebrew gtimeout, or perl (always on macOS).
+with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+  else perl -e 'my $s = shift @ARGV; my $pid = fork(); if (!$pid) { exec @ARGV; exit 127 }
+                $SIG{ALRM} = sub { kill "TERM", $pid; exit 124 }; alarm $s;
+                waitpid($pid, 0); exit($? >> 8)' "$secs" "$@"
+  fi
+}
+
+PROVIDER="${MODEL%%/*}"
+IFS=$'\t' read -r D_STATUS PROTOCOL NPM URL BILLING REASONING INTERLEAVED <<EOF
+$(with_timeout 120 opencode models "$PROVIDER" --verbose </dev/null 2>/dev/null | "$RUNTIME" "$HELPER" describe "$MODEL")
+EOF
+[ "$D_STATUS" = "OK" ] || die_setup "opencode does not list $MODEL (check: opencode models $PROVIDER). Credentials missing, or a typo in the id."
+if [ "$PROTOCOL" = "unknown" ]; then warn "protocol: UNKNOWN (npm package: $NPM)"; else ok "protocol: $PROTOCOL ($NPM)"; fi
+info "endpoint: $URL  [$BILLING]"
+info "reasoning: $REASONING$([ "$INTERLEAVED" != "-" ] && printf ', interleaved via %s' "$INTERLEAVED")"
+
+TELE="$WORKDIR/telemetry.jsonl"
+export TEAMWORK_TELEMETRY_FILE="$TELE"
+tele_count() { "$RUNTIME" "$HELPER" count "$TELE"; }
+
+# Run one opencode turn. JSON output: only the assistant's own text, so a
+# marker can never be matched from an echoed prompt.
+oc_run() {
+  local label="$1" dir="$2"; shift 2
   set +e
-  timeout "$TIMEOUT" opencode "$@" >"$logfile" 2>&1
+  # stdin from /dev/null: `opencode run` reads a piped stdin into the message
+  # and blocks until it closes, so an inherited open pipe hangs it forever.
+  (cd "$dir" && with_timeout "$TIMEOUT" opencode run --auto --format json "$@") \
+    </dev/null >"$WORKDIR/$label.json" 2>"$WORKDIR/$label.err"
   local rc=$?
   set -e
-  printf '%s' "$rc" > "$WORKDIR/$label.rc"
+  echo "$rc" > "$WORKDIR/$label.rc"
   if [ "$rc" -eq 124 ]; then
-    printf '    timed out after %ss\n' "$TIMEOUT" >&2
+    warn "opencode did not finish within ${TIMEOUT}s."
+    info "The first run in a config directory also installs @opencode-ai/plugin there,"
+    info "which can take a few minutes. Re-run, or raise --timeout."
   fi
-  return 0
 }
+texts() { "$RUNTIME" "$HELPER" texts "$WORKDIR/$1.json"; }
 
-log_of()  { cat "$WORKDIR/$1.log" 2>/dev/null || true; }
-rc_of()   { cat "$WORKDIR/$1.rc" 2>/dev/null || echo 1; }
-excerpt() { sed -e 's/^/      | /' "$WORKDIR/$1.log" 2>/dev/null | head -25; }
-
-# The failure signature we are hunting: a 400 from the provider, or a
-# structurally empty answer where a subagent result should be.
-assert_no_provider_error() {
-  local label="$1"
-  local body; body="$(log_of "$label")"
-  case "$body" in
-    *"400"*|*"Bad Request"*|*"AI_APICallError"*|*"invalid_request_error"*)
-      printf '    provider error in transcript:\n' >&2
-      excerpt "$label" >&2
-      return 1 ;;
-  esac
-  return 0
-}
-
-FAILURES=0
-note_failure() { FAILURES=$((FAILURES + 1)); printf '  \033[31m✗\033[0m %s\n' "$1" >&2; }
+SCRATCH="$WORKDIR/scratch"; mkdir -p "$SCRATCH"
 
 # ─── A. primary ──────────────────────────────────────────────────────
 
 head_ "A. Does the model answer as the PRIMARY agent?"
-
-MARKER="TEAMWORK_PRIMARY_OK"
-run_opencode primary run --model "$MODEL_ID" \
-  "Reply with exactly this token and nothing else: $MARKER"
-
-if [ "$(rc_of primary)" != "0" ]; then
-  note_failure "opencode exited $(rc_of primary) as primary"
-  excerpt primary >&2
-elif ! assert_no_provider_error primary; then
-  note_failure "provider error as primary"
-elif ! log_of primary | grep -q "$MARKER"; then
-  note_failure "primary produced no usable answer (marker '$MARKER' absent)"
-  excerpt primary >&2
+BEFORE=$(tele_count)
+oc_run primary "$SCRATCH" -m "$MODEL" "Reply with the words BLUE and FALCON joined by an underscore, in capitals, and nothing else."
+PRIMARY=$("$RUNTIME" "$HELPER" tele "$TELE" "$BEFORE" primary)
+if [ "$(cat "$WORKDIR/primary.rc")" = "124" ] && [ "$(tele_count)" = "$BEFORE" ]; then
+  die_setup "opencode timed out before making any model call (see above), so nothing could be checked."
+fi
+if [ "$(tele_count)" = "$BEFORE" ]; then
+  die_setup "no model call was recorded. The teamwork plugin did not load, or the loaded build has
+   no usage observer (npm 0.2.1 and upstream builds do not). Look for 'failed to load plugin' in:
+     opencode run --print-logs \"hi\"
+   and install this checkout:  opencode-teamwork install --all-seats $MODEL --plugin local"
+fi
+A_ERR=$(printf '%s\n' "$PRIMARY" | awk -F'\t' '$6 != "-" {print $6; exit}')
+A_OTHER=$(printf '%s\n' "$PRIMARY" | awk -F'\t' -v m="$MODEL" 'tolower($2) != tolower(m) {print $2; exit}')
+A_REASON=$(printf '%s\n' "$PRIMARY" | awk -F'\t' '$4 > 0 {r=1} END {print r ? "yes" : "no"}')
+if [ -n "$A_ERR" ]; then fail "provider error as primary: $A_ERR"
+elif [ -n "$A_OTHER" ]; then fail "the primary call was served by $A_OTHER, not $MODEL"
 else
-  ok "the model answers as primary over the $PROTOCOL protocol"
+  ok "answered as primary over $PROTOCOL (recorded by opencode; reasoning tokens: $A_REASON)"
+  texts primary | grep -q "BLUE_FALCON" || warn "it answered, but not with BLUE_FALCON: $(texts primary | head -c 120)"
 fi
 
-# ─── B. tool calling as primary ──────────────────────────────────────
+# ─── B. tool calling ─────────────────────────────────────────────────
 
 head_ "B. Does it CALL TOOLS as the primary agent?"
-# Tool-calling is where the two protocols actually differ, so this is not
-# redundant with A. Asserted against a file on disk, not against prose.
+PROBE="$SCRATCH/tool-probe.txt"
+oc_run tools "$SCRATCH" -m "$MODEL" "Use your file writing tool to create the file $PROBE containing exactly the word CALLED. Do not print it."
+if [ -f "$PROBE" ] && grep -q "CALLED" "$PROBE"; then ok "a tool call over $PROTOCOL reached the filesystem"
+else fail "no tool call reached the filesystem: $PROBE was not written"; fi
 
-PROBE="$WORKDIR/tool-probe.txt"
-run_opencode tools run --model "$MODEL_ID" \
-  "Use your file writing tool to create the file $PROBE containing exactly the word CALLED. Do not print the content, just create the file."
-
-if [ -f "$PROBE" ] && grep -q "CALLED" "$PROBE" 2>/dev/null; then
-  ok "tool call round-tripped over the $PROTOCOL protocol (file written)"
-elif ! assert_no_provider_error tools; then
-  note_failure "provider error during tool call"
-else
-  note_failure "no tool call reached the filesystem — $PROBE was not written"
-  info "  Tool-calling behaviour differs between the OpenAI and Anthropic"
-  info "  protocols. A teamwork run is entirely tool calls; this must pass."
-  excerpt tools >&2
-fi
-
-# ─── C. subagent delegation (the known failure mode) ─────────────────
+# ─── C. subagent ─────────────────────────────────────────────────────
 
 head_ "C. Does it answer as a SUBAGENT through the task tool?"
-
-SUB_MARKER="TEAMWORK_SUBAGENT_OK"
-run_opencode subagent run --model "$MODEL_ID" \
-  "Use the task tool to delegate to a general subagent. Instruct that subagent to reply with exactly the token $SUB_MARKER. When it returns, print the subagent's reply verbatim on its own line."
-
-SUB_BODY="$(log_of subagent)"
-if [ "$(rc_of subagent)" != "0" ]; then
-  note_failure "opencode exited $(rc_of subagent) during delegation"
-  excerpt subagent >&2
-elif ! assert_no_provider_error subagent; then
-  note_failure "PROVIDER ERROR AS SUBAGENT — this is the known failure mode."
-  info "  The model works as primary but the provider rejects the subagent"
-  info "  call. Every teamwork worker and verifier is a subagent, so the"
-  info "  orchestration loop cannot run until this is fixed."
-elif ! printf '%s' "$SUB_BODY" | grep -q "$SUB_MARKER"; then
-  note_failure "the subagent returned nothing usable (marker '$SUB_MARKER' absent)"
-  info "  An empty subagent response with no error is the signature of the"
-  info "  HTTP 400 delegation failure. Check the provider logs."
-  excerpt subagent >&2
+NONCE="nonce-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+printf '%s\n' "$NONCE" > "$SCRATCH/nonce.txt"
+BEFORE=$(tele_count)
+oc_run subagent "$SCRATCH" -m "$MODEL" "Use the task tool to start a general subagent. Tell it to read the file $SCRATCH/nonce.txt and reply with the file's exact contents. Do not read the file yourself. When it returns, repeat its reply."
+SUB=$("$RUNTIME" "$HELPER" tele "$TELE" "$BEFORE" sub)
+if [ -z "$SUB" ]; then
+  fail "no subagent call was recorded: the model never used the task tool, so delegation is untested"
 else
-  ok "subagent delegation round-trips over the $PROTOCOL protocol"
+  C_ERR=$(printf '%s\n' "$SUB" | awk -F'\t' '$6 != "-" {print $6 "\t" $7; exit}')
+  C_OTHER=$(printf '%s\n' "$SUB" | awk -F'\t' -v m="$MODEL" 'tolower($2) != tolower(m) {print $1 " on " $2; exit}')
+  if [ -n "$C_ERR" ]; then
+    fail "PROVIDER ERROR IN THE SUBAGENT — the known delegation failure:"
+    info "$(printf '%s\n' "$C_ERR" | cut -f1)"
+    info "response body: $(printf '%s\n' "$C_ERR" | cut -f2)"
+    info "It works as primary but not as a subagent, so no teamwork run can succeed."
+  elif [ -n "$C_OTHER" ]; then
+    fail "the subagent ran as $C_OTHER, not $MODEL"
+  else
+    ok "a subagent answered over $PROTOCOL (a recorded child-session call)"
+    texts subagent | grep -q "$NONCE" && info "and its answer reached the parent" || warn "the parent did not repeat the subagent's answer"
+    C_REASON=$(printf '%s\n' "$SUB" | awk -F'\t' '$4 > 0 {r=1} END {print r ? "yes" : "no"}')
+    [ "$C_REASON" = "$A_REASON" ] || warn "reasoning differs: primary $A_REASON, subagent $C_REASON. Seats may not be thinking alike."
+  fi
 fi
 
-# ─── D. the plugin's own dispatch path ───────────────────────────────
+# ─── D. the plugin's own engine ──────────────────────────────────────
 
 if [ "$SKIP_DISPATCH" -eq 1 ]; then
-  head_ "D. Plugin dispatch path — SKIPPED (--skip-dispatch)"
+  head_ "D. Plugin engine round trip — SKIPPED (--skip-dispatch)"
 else
-  head_ "D. One full round-trip through the plugin's dispatch path"
-
-  REPO="$WORKDIR/repo"
-  mkdir -p "$REPO"
-  (
-    cd "$REPO"
-    git init -q
-    git config user.email smoke@example.invalid
-    git config user.name "smoke"
-    printf 'export const add = (a, b) => a + b;\n' > index.js
-    git add -A
-    git commit -qm "init"
-  )
-
-  # Drive the sentinel through plan -> dispatch -> verify. The assertion is
-  # the event log on disk, not the model's summary of what it did.
-  run_opencode dispatch run --model "$MODEL_ID" --agent team/sentinel \
-    "Do not implement anything. Exercise the run engine only, in this exact order:
-1. Call teamwork_plan with topology small-focused and a single task
-   {taskId: smoke, title: 'smoke check'}, budgetUsd 1, worktrees false.
-2. Call teamwork_dispatch for that sessionId.
-3. Run the shell command 'true' in this directory, then call teamwork_verify
-   for taskId smoke with status PASS and one programmatic check named 'smoke'
-   recording cmd 'true' and exitCode 0.
-4. Print the sessionId on its own line.
-Then stop."
-
-  EVENTS="$(find "$REPO/.opencode/teamwork" -name events.jsonl 2>/dev/null | head -1 || true)"
-
-  if [ -z "$EVENTS" ]; then
-    note_failure "no event log was written — teamwork_plan never ran"
-    excerpt dispatch >&2
+  head_ "D. One round trip through the plugin's engine (/teamwork)"
+  REPO="$WORKDIR/repo"; mkdir -p "$REPO"
+  (cd "$REPO" && git init -q && git config user.email smoke@example.invalid && git config user.name smoke &&
+   printf 'x\n' > f && git add -A && git commit -qm init)
+  oc_run dispatch "$REPO" --command teamwork "Smoke test of the run engine only; change no files and ask no questions. Call teamwork_plan with topology small-focused, worktrees false, and one task: taskId smoke, title smoke check. Then call teamwork_dispatch. Then run the shell command true and call teamwork_verify for taskId smoke with status PASS and one programmatic check named smoke with cmd true and exitCode 0. Then stop. --budget 1"
+  IFS=$'\t' read -r RUN_DIR TYPES USAGE MODELS BUDGET <<EOF
+$("$RUNTIME" "$HELPER" run "$REPO")
+EOF
+  if [ "$RUN_DIR" = "NONE" ]; then
+    fail "no event log was written: teamwork_plan never ran"
   else
-    ok "event log: $EVENTS"
     missing=""
-    for ev in session.start plan.written task.dispatched verification.report task.completed; do
-      grep -q "\"$ev\"" "$EVENTS" || missing="$missing $ev"
+    for t in session.start plan.written task.dispatched verification.report task.completed; do
+      case ",$TYPES," in *",$t,"*) ;; *) missing="$missing $t" ;; esac
     done
-    if [ -n "$missing" ]; then
-      note_failure "dispatch path incomplete — missing events:$missing"
-      info "  present:"
-      "$RUNTIME" -e '
-        const fs=require("node:fs");
-        const seen=new Set();
-        for (const l of fs.readFileSync(process.argv[1],"utf-8").split("\n")) {
-          if (!l.trim()) continue;
-          try { seen.add(JSON.parse(l).type); } catch {}
-        }
-        console.log("    " + [...seen].join(", "));
-      ' "$EVENTS" 2>/dev/null || true
-      excerpt dispatch >&2
-    else
-      ok "plan -> dispatch -> verify -> completed, all recorded in the log"
-    fi
+    if [ -n "$missing" ]; then fail "engine round trip incomplete, missing:$missing (present: $TYPES)"
+    else ok "plan, dispatch, verify, completed: all in the hash-chained log"; fi
+    if [ "$USAGE" -gt 0 ]; then ok "$USAGE model calls metered into the run"
+    else fail "nothing was metered into the run: the budget would fall back to self-reported cost"; fi
+    if [ -n "$MODELS" ] && [ "$(printf '%s' "$MODELS" | tr ',' '\n' | awk -v m="$MODEL" 'tolower($0) != tolower(m)' | head -1)" != "" ]; then
+      fail "SEAT LEAK: the run used $MODELS, not only $MODEL"
+    elif [ -n "$MODELS" ]; then ok "every model call in the run was on $MODEL"; fi
+    [ "$BUDGET" = "1" ] && ok "--budget 1 reached the engine" || fail "--budget 1 did not reach the engine (it started at $BUDGET)"
   fi
 fi
 
 # ─── Verdict ─────────────────────────────────────────────────────────
 
 head_ "Verdict"
-
 if [ "$FAILURES" -gt 0 ]; then
-  printf '  \033[31m✗ %s check(s) failed.\033[0m Do not start an orchestration run.\n' "$FAILURES"
-  printf '    model:    %s\n' "$MODEL_ID"
-  printf '    protocol: %s\n' "$PROTOCOL"
-  [ "$KEEP" -eq 1 ] || printf '    Re-run with --keep to inspect the transcripts.\n'
+  printf '  %s Do not start an orchestration run.\n' "$(red "✗ $FAILURES check(s) failed.")"
+  [ "$KEEP" -eq 1 ] || info "Re-run with --keep to inspect the transcripts."
   exit 1
 fi
-
-printf '  \033[32m✓ All delegation checks passed.\033[0m\n'
-printf '    model:    %s\n' "$MODEL_ID"
-printf '    protocol: %s%s\n' "$PROTOCOL" \
-  "$([ "$PROTOCOL" = unknown ] && printf '  (UNVERIFIED — identify this before trusting the result)' || true)"
-printf '    This is evidence for the %s protocol only.\n' "$PROTOCOL"
+printf '  %s\n' "$(green '✓ All delegation checks passed.')"
+info "model: $MODEL | protocol: $PROTOCOL | endpoint: $BILLING"
+info "This is evidence for the $PROTOCOL protocol only."
 exit 0
