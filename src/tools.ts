@@ -31,6 +31,7 @@ import { Engine, dispatchWaves, type DagTask, type VerificationReport } from "./
 import { verifyChain, describeLogDamage, readEventLog, readEvents, deriveSession, writeSnapshot } from "./events.js";
 import { ENGINE_ROLES } from "./guard.js";
 import { DEFAULT_POLICY, TOPOLOGY_NAMES, type Policy } from "./policy.js";
+import { pointerFor, type RunPointer } from "./run-pointer.js";
 import { createWorktreeManager, runDirFor } from "./worktree.js";
 import { ALL_SEATS_ENV, singleModelRouting } from "./cli/all-seats.js";
 import { repairArtifact, VERIFICATION_REPORT_HINT } from "./repair.js";
@@ -173,6 +174,51 @@ const tool_schemaBool = () =>
         "plan it corresponds to nothing billed. false disables the cap entirely.",
     );
 
+interface PlanFlags {
+  topology: string;
+  sessionId?: string;
+  budgetUsd?: number;
+  maxConcurrency?: number;
+}
+
+/**
+ * Overlay the flags the user typed after /teamwork onto the plan arguments.
+ *
+ * The command hook parses them in code and writes them to the run pointer,
+ * but they used to reach the engine only if the model copied each one into
+ * teamwork_plan's arguments. A model that forgot --budget got the default,
+ * and one that omitted sessionId minted a second run directory beside the one
+ * holding request.md. The user's typed value wins over a different value
+ * from the model, and every value applied this way is reported.
+ */
+export function applyCommandFlags<A extends PlanFlags>(
+  args: A,
+  pointer: RunPointer | null,
+): { args: A; notes: string[] } {
+  if (!pointer) return { args, notes: [] };
+  const notes: string[] = [];
+  const pick = <T>(flag: string, typed: T | undefined, requested: T | undefined): T | undefined => {
+    if (typed === undefined) return requested;
+    notes.push(
+      requested !== undefined && requested !== typed
+        ? `applied ${flag} ${String(typed)} from your command (the plan asked for ${String(requested)})`
+        : `applied ${flag} ${String(typed)} from your command`,
+    );
+    return typed;
+  };
+  const budgetUsd = pick("--budget", pointer.budgetUsd, args.budgetUsd);
+  const maxConcurrency = pick("--concurrency", pointer.maxConcurrency, args.maxConcurrency);
+  return {
+    notes,
+    args: {
+      ...args,
+      topology: pick("--topology", pointer.topology, args.topology) ?? args.topology,
+      sessionId: args.sessionId ?? pointer.sessionId,
+      ...(budgetUsd !== undefined ? { budgetUsd } : {}),
+      ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+    },
+  };
+}
 
 const taskArg = tool.schema.object({
   taskId: tool.schema.string().describe("stable id, [A-Za-z0-9._-]{1,64}"),
@@ -202,6 +248,8 @@ export const teamworkPlan: ToolDefinition = tool({
   async execute(args, context) {
     const denied = gate(context, "teamwork_plan");
     if (denied) return denied;
+    const flags = applyCommandFlags(args, pointerFor(context.directory, context.sessionID));
+    args = flags.args;
 
     const sessionId = args.sessionId ?? mintSessionId();
     const runDir = runDirFor(context.directory, sessionId);
@@ -333,6 +381,7 @@ export const teamworkPlan: ToolDefinition = tool({
       `waves: ${waves.map((w, i) => `[${i + 1}] ${w.join(" + ")}`).join("  ")}`,
       worktreeNotes.length > 0 ? `worktrees:\n  ${worktreeNotes.join("\n  ")}` : "",
       `specs written: ${tasks.map((t) => `spec-${t.taskId}.json`).join(", ")}`,
+      ...flags.notes,
       "",
       statusLine(engine),
       "",

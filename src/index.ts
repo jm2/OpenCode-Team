@@ -26,6 +26,7 @@ import { RoleRegistry } from "./guard.js";
 import { assertTopologiesResolve, DEFAULT_POLICY, isTopology, TOPOLOGY_NAMES } from "./policy.js";
 import { getAllCommands, agentConfigs } from "./templates.js";
 import { TEAMWORK_TOOLS } from "./tools.js";
+import { readRunPointer, writeRunPointer } from "./run-pointer.js";
 import { runDirFor } from "./worktree.js";
 
 export interface ParsedCommandFlags {
@@ -117,37 +118,6 @@ export function parseCommandFlags(input: string, mint: () => string): ParsedComm
     request: rest.join(" ").trim(),
     warnings,
   };
-}
-
-interface RunPointer {
-  sessionId: string;
-  topology?: string;
-  budgetUsd?: number;
-  maxConcurrency?: number;
-  budgetEnforced?: boolean;
-  request?: string;
-  createdAt: string;
-  opencodeSessionID?: string;
-}
-
-function latestPointerPath(projectDir: string): string {
-  return join(projectDir, ".opencode", "teamwork", "LATEST.json");
-}
-
-function writeRunPointer(projectDir: string, pointer: RunPointer): void {
-  const dir = join(projectDir, ".opencode", "teamwork");
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(latestPointerPath(projectDir), `${JSON.stringify(pointer, null, 2)}\n`, "utf-8");
-}
-
-function readRunPointer(projectDir: string): RunPointer | null {
-  const path = latestPointerPath(projectDir);
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, "utf-8")) as RunPointer;
-  } catch {
-    return null;
-  }
 }
 
 export const TeamPlugin: Plugin = async (ctx) => {
