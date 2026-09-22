@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -54,7 +54,7 @@ describe("happy path", () => {
   test("raw output is preserved even when it validates", () => {
     const dir = runDir();
     repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(GOOD)));
-    expect(existsSync(join(dir, "repair", "t1.attempt-1.raw.json"))).toBe(true);
+    expect(existsSync(join(dir, "repair", "t1.001.raw.json"))).toBe(true);
   });
 });
 
@@ -66,7 +66,7 @@ describe("bounded repair", () => {
     if (out.kind !== "repair") return;
     expect(out.attempt).toBe(1);
     expect(out.error).toContain("not valid JSON");
-    expect(out.instruction).toContain("Re-emit the WHOLE artifact");
+    expect(out.instruction).toContain("Send this error back to the verifier");
   });
 
   test("the Zod error is fed back verbatim", () => {
@@ -169,7 +169,7 @@ describe("failing loudly preserves the evidence", () => {
     out = repairArtifact(VerificationReportSchema, opts(dir, "{}"));
     expect(out.kind).toBe("exhausted");
     if (out.kind !== "exhausted") return;
-    expect(out.instruction).toContain("do NOT hand-write a substitute");
+    expect(out.instruction).toContain("do NOT write a substitute report yourself");
     expect(out.instruction).toContain("Do NOT resubmit");
   });
 
@@ -345,5 +345,102 @@ describe("--no-budget (Phase 4b)", () => {
     });
     expect(e.budgetExhausted()).toBe(true);
     expect(e.dispatchable(5)).toEqual([]);
+  });
+});
+
+// ─── Review findings: wedge, overwrite, contradictory instruction ────
+
+describe("repair exhaustion through teamwork_verify", () => {
+  async function setup(tasks: Array<Record<string, unknown>>) {
+    const { teamworkPlan, teamworkDispatch, teamworkVerify } = await import("../src/tools.ts");
+    const project = mkdtempSync(join(tmpdir(), "wedge-"));
+    const ctx = { agent: "team/sentinel", directory: project, sessionID: "x" } as any;
+    await (teamworkPlan as any).execute({ topology: "small-focused", sessionId: "w", tasks, worktrees: false }, ctx);
+    const bad = join(project, "bad.json");
+    writeFileSync(bad, "{}");
+    return {
+      project,
+      dispatch: () => (teamworkDispatch as any).execute({ sessionId: "w" }, ctx) as Promise<string>,
+      verify: (taskId: string) => (teamworkVerify as any).execute({ sessionId: "w", taskId, reportPath: bad }, ctx) as Promise<string>,
+    };
+  }
+
+  test("marks the task FAILED and frees its slot, so the run moves on", async () => {
+    // Concurrency 1: a task left DISPATCHED used to block every other task.
+    const r = await setup([{ taskId: "a", title: "a" }, { taskId: "b", title: "b" }]);
+    await r.dispatch();
+    let out = "";
+    for (let i = 0; i < 3; i += 1) out = await r.verify("a");
+    expect(out).toContain("task marked FAILED");
+    const { Engine } = await import("../src/engine.ts");
+    const { runDirFor } = await import("../src/worktree.ts");
+    const e = Engine.resume(runDirFor(r.project, "w"));
+    expect(e.status().tasks.find((t) => t.taskId === "a")!.status).toBe("FAILED");
+    expect(e.dispatchable(5).map((t) => t.taskId)).toEqual(["b"]);
+  });
+
+  test("parks dependents and lets the run finish", async () => {
+    const r = await setup([{ taskId: "a", title: "a" }, { taskId: "b", title: "b", dependsOn: ["a"] }]);
+    await r.dispatch();
+    let out = "";
+    for (let i = 0; i < 3; i += 1) out = await r.verify("a");
+    expect(out).toContain("because they depend on it: b");
+    const { Engine } = await import("../src/engine.ts");
+    const { runDirFor } = await import("../src/worktree.ts");
+    expect(Engine.resume(runDirFor(r.project, "w")).status().state).toBe("DONE");
+  });
+
+  test("every rejection is in the hash-chained log", async () => {
+    const r = await setup([{ taskId: "a", title: "a" }]);
+    await r.dispatch();
+    await r.verify("a");
+    await r.verify("a");
+    const { readEvents, verifyChain } = await import("../src/events.ts");
+    const { runDirFor } = await import("../src/worktree.ts");
+    const events = readEvents(runDirFor(r.project, "w"));
+    const rejected = events.filter((e) => e.type === "artifact.rejected");
+    expect(rejected.length).toBe(2);
+    expect(rejected[1]!.data).toMatchObject({ attempt: 2, artifact: "verification_report.json" });
+    expect(verifyChain(events).ok).toBe(true);
+  });
+});
+
+describe("raw evidence survives across rounds", () => {
+  test("a later round's failure never overwrites an earlier round's", () => {
+    const dir = runDir();
+    const round1Bad = '{"round":1}';
+    repairArtifact(VerificationReportSchema, opts(dir, round1Bad)); // round 1, attempt 1
+    repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(GOOD))); // round 1 accepted
+    repairArtifact(VerificationReportSchema, opts(dir, '{"round":2}')); // round 2, attempt 1
+    const files = readdirSync(join(dir, "repair")).filter((f) => f.endsWith(".raw.json")).sort();
+    expect(files).toEqual(["t1.001.raw.json", "t1.002.raw.json", "t1.003.raw.json"]);
+    expect(readFileSync(join(dir, "repair", "t1.001.raw.json"), "utf-8")).toBe(round1Bad);
+  });
+
+  test("an accepted report deletes the ledger rather than leaving a stub", () => {
+    const dir = runDir();
+    repairArtifact(VerificationReportSchema, opts(dir, "{}"));
+    repairArtifact(VerificationReportSchema, opts(dir, JSON.stringify(GOOD)));
+    expect(existsSync(join(dir, "repair", "t1.ledger.json"))).toBe(false);
+  });
+});
+
+describe("the instruction agrees with the engine", () => {
+  test("it never tells the model to give an unexecuted check an exit code", async () => {
+    const { VERIFICATION_REPORT_HINT } = await import("../src/repair.ts");
+    expect(VERIFICATION_REPORT_HINT).toContain("Never give it an exit code");
+    expect(VERIFICATION_REPORT_HINT).not.toContain("reporting it as failed");
+  });
+
+  test("an unexecuted check recorded as the hint says is accepted by the engine", async () => {
+    const { validateReport } = await import("../src/engine.ts");
+    const report = {
+      ...GOOD,
+      checks: [
+        { name: "tests", type: "programmatic", passed: true, cmd: "bun test", exitCode: 0 },
+        { name: "manual review", type: "rubric", passed: false },
+      ],
+    } as any;
+    expect(validateReport(report).ok).toBe(true);
   });
 });

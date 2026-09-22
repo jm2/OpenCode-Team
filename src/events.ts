@@ -44,7 +44,9 @@ export type EventType =
   | "budget.warning"
   | "budget.exhausted"
   | "session.done"
-  | "session.error";
+  | "session.error"
+  /** A model-authored artifact failed validation; see src/repair.ts. */
+  | "artifact.rejected";
 
 export interface RunEvent {
   seq: number;

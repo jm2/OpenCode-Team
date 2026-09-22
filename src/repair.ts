@@ -26,7 +26,7 @@
  * no report — the whole point of the artifact bus is that a PASS is evidence.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { z } from "zod";
 
@@ -91,24 +91,28 @@ function writeLedger(runDir: string, ledger: RepairLedger): void {
 }
 
 export function clearLedger(runDir: string, taskId: string): void {
-  const path = ledgerPath(runDir, taskId);
-  if (existsSync(path)) writeFileSync(path, `${JSON.stringify({ cleared: true }, null, 2)}\n`, "utf-8");
+  rmSync(ledgerPath(runDir, taskId), { force: true });
 }
 
 /**
  * Persist a raw submission before judging it. Returns the path.
  *
- * This runs on every attempt, valid or not: when a run does fail, the operator
- * needs what the model actually emitted, not a summary of why it was rejected.
+ * This runs on every submission, valid or not: when a run does fail, the
+ * operator needs what the model actually emitted, not a summary of why it
+ * was rejected. Files are numbered per task across the whole run and never
+ * reused — numbering them by repair attempt restarted at 1 each round, so a
+ * later round's first failure overwrote an earlier round's evidence.
  */
-export function preserveRaw(
-  runDir: string,
-  taskId: string,
-  attempt: number,
-  raw: string,
-): string {
-  mkdirSync(repairDir(runDir), { recursive: true });
-  const path = join(repairDir(runDir), `${sanitize(taskId)}.attempt-${attempt}.raw.json`);
+export function preserveRaw(runDir: string, taskId: string, raw: string): string {
+  const dir = repairDir(runDir);
+  mkdirSync(dir, { recursive: true });
+  const prefix = `${sanitize(taskId)}.`;
+  const taken = readdirSync(dir)
+    .filter((f) => f.startsWith(prefix) && f.endsWith(".raw.json"))
+    .map((f) => Number.parseInt(f.slice(prefix.length), 10))
+    .filter((n) => Number.isFinite(n));
+  const next = (taken.length > 0 ? Math.max(...taken) : 0) + 1;
+  const path = join(dir, `${prefix}${String(next).padStart(3, "0")}.raw.json`);
   writeFileSync(path, raw, "utf-8");
   return path;
 }
@@ -197,7 +201,7 @@ export function repairArtifact<T>(
   const priorAttempts = prior && typeof prior.attempts === "number" ? prior.attempts : 0;
   const attempt = priorAttempts + 1;
 
-  const rawPath = preserveRaw(runDir, taskId, attempt, raw);
+  const rawPath = preserveRaw(runDir, taskId, raw);
 
   // Two failure modes, one path: malformed JSON and well-formed JSON of the
   // wrong shape both land here with a readable reason.
@@ -242,16 +246,15 @@ export function repairArtifact<T>(
       rawPath,
       rawPaths: ledger.rawPaths,
       instruction: [
-        `${label} FAILED VALIDATION ${attempt} times. Giving up on this artifact.`,
+        `${label} FAILED VALIDATION ${attempt} times. The engine has marked this task FAILED.`,
         `  last error: ${error}`,
         ``,
         `Every raw submission has been preserved:`,
         ...ledger.rawPaths.map((p) => `  ${p}`),
         ``,
-        `Do NOT resubmit and do NOT hand-write a substitute object — a report`,
-        `that was not produced by a real verification run is worse than none.`,
-        `Report this failure to the user with the paths above. The task stays`,
-        `unverified; the engine has not counted a round for it.`,
+        `Do NOT resubmit and do NOT write a substitute report yourself: a report that`,
+        `no verifier produced is worse than none. Report this failure to the user`,
+        `with the paths above, then carry on with whatever else is dispatchable.`,
       ].join("\n"),
     };
   }
@@ -265,28 +268,33 @@ export function repairArtifact<T>(
     instruction: [
       `${label} failed validation (repair ${attempt} of ${maxRepairs}).`,
       `  error: ${error}`,
-      `  your raw output was saved to: ${rawPath}`,
+      `  the submission was saved to: ${rawPath}`,
       ``,
-      `Re-emit the WHOLE artifact as a single JSON object matching this shape`,
+      `Send this error back to the verifier and have it write the report again.`,
+      `Do not edit the report yourself: the verifier is the one who ran the checks.`,
+      `The report must be a single JSON object with this shape`,
       `("?" marks an optional field; everything else is required):`,
       ``,
       shape,
       ``,
       ...(options.hint ? [options.hint, ``] : []),
-      `Fix only what the error names. Do not invent values to satisfy the`,
-      `schema — if a check was not actually executed, say so by reporting it`,
-      `as failed rather than inventing an exit code.`,
-      `${maxRepairs - attempt} repair attempt(s) remain before this artifact is abandoned.`,
+      `${maxRepairs - attempt} repair attempt(s) remain before the task is marked FAILED.`,
     ].join("\n"),
   };
 }
 
-/** Domain hint for the verification report — the boundary that matters. */
+/**
+ * Domain hint for the verification report, consistent with what the engine's
+ * validateReport() accepts. An unexecuted check cannot be reported as a
+ * failed programmatic check, because that also needs an exit code.
+ */
 export const VERIFICATION_REPORT_HINT = [
-  `Reminder for verification_report.json specifically:`,
+  `For verification_report.json specifically:`,
   `  - "checks" needs at least one entry.`,
-  `  - programmatic/adversarial checks must carry the real "cmd" and its`,
-  `    integer "exitCode". A PASS needs at least one such executed check.`,
-  `  - "passed": true requires exitCode 0; "passed": false requires non-zero.`,
+  `  - A programmatic or adversarial check records the real "cmd" that ran`,
+  `    and its integer "exitCode": "passed": true with 0, false with non-zero.`,
+  `  - A check that was not actually run is left out, or recorded as type`,
+  `    "rubric" with no cmd or exitCode. Never give it an exit code.`,
+  `  - A PASS needs at least one check that actually ran.`,
   `  - "stdoutSha256", if present, is 64 lower-case hex characters.`,
 ].join("\n");

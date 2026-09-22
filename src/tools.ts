@@ -28,7 +28,7 @@ import {
   parseArtifact,
 } from "./artifacts.js";
 import { Engine, dispatchWaves, type DagTask, type VerificationReport } from "./engine.js";
-import { verifyChain, describeLogDamage, readEventLog, readEvents, deriveSession, writeSnapshot } from "./events.js";
+import { appendEvent, verifyChain, describeLogDamage, readEventLog, readEvents, deriveSession, writeSnapshot } from "./events.js";
 import { ENGINE_ROLES } from "./guard.js";
 import { DEFAULT_POLICY, TOPOLOGY_NAMES, type Policy } from "./policy.js";
 import { pointerFor, type RunPointer } from "./run-pointer.js";
@@ -601,16 +601,45 @@ export const teamworkVerify: ToolDefinition = tool({
       hint: VERIFICATION_REPORT_HINT,
     });
 
+    if (repaired.kind !== "ok") {
+      // Every rejection goes into the hash-chained log with the path of the
+      // preserved submission, so the record shows what was refused and why.
+      appendEvent(runDir, {
+        type: "artifact.rejected",
+        sessionId: args.sessionId,
+        taskId: args.taskId,
+        data: {
+          artifact: "verification_report.json",
+          attempt: repaired.kind === "repair" ? repaired.attempt : repaired.attempts,
+          maxRepairs: repaired.maxRepairs,
+          error: repaired.error,
+          rawPath: repaired.rawPath,
+        },
+      });
+    }
     if (repaired.kind === "exhausted") {
-      // Loud, terminal, evidence preserved. The round is NOT counted and no
-      // object is fabricated to stand in for the one that never parsed.
+      // Loud and terminal, evidence preserved. No round is counted and no
+      // object is fabricated. The task is marked FAILED so it stops holding
+      // a concurrency slot, its dependents are parked, and the run can end;
+      // left DISPATCHED it wedged every run with a concurrency cap of one.
+      const failed = engine.failTask(
+        args.taskId,
+        `verification report failed validation ${repaired.attempts} times`,
+        { rawPaths: repaired.rawPaths, lastError: repaired.error },
+      );
       return [
-        `report REJECTED for ${args.taskId} — validation exhausted.`,
+        `report REJECTED for ${args.taskId} — validation exhausted; task marked FAILED.`,
+        failed.parkedDependents.length > 0
+          ? `  also dead-lettered, because they depend on it: ${failed.parkedDependents.join(", ")}`
+          : "",
         "",
         repaired.instruction,
         "",
         statusLine(engine),
-      ].join("\n");
+        nextActions(engine),
+      ]
+        .filter((l, i, all) => l !== "" || (i > 0 && all[i - 1] !== ""))
+        .join("\n");
     }
     if (repaired.kind === "repair") {
       return [

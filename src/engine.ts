@@ -787,6 +787,24 @@ export class Engine {
       });
     }
 
+    this.closeIfDone(after);
+    this.snapshot();
+
+    return {
+      accepted: true,
+      taskId: input.taskId,
+      status,
+      attempt,
+      maxRounds,
+      ...(reason ? { reason } : {}),
+      ...(status === "PENDING" ? { nextModel: this.modelFor(input.taskId, attempt) } : {}),
+      ...(parkedDependents.length > 0 ? { parkedDependents } : {}),
+    };
+  }
+
+  /** Append session.done once every task is terminal. */
+  private closeIfDone(after: DerivedSession = deriveSession(this.events())): void {
+    if (after.state === "DONE") return;
     const allTerminal = after.order.every((id) => {
       const s = after.tasks[id]?.status;
       return s === "COMPLETED" || s === "FAILED" || s === "DEADLETTER";
@@ -803,18 +821,31 @@ export class Engine {
         },
       });
     }
-    this.snapshot();
+  }
 
-    return {
-      accepted: true,
-      taskId: input.taskId,
-      status,
-      attempt,
-      maxRounds,
-      ...(reason ? { reason } : {}),
-      ...(status === "PENDING" ? { nextModel: this.modelFor(input.taskId, attempt) } : {}),
-      ...(parkedDependents.length > 0 ? { parkedDependents } : {}),
-    };
+  /**
+   * Mark a task FAILED outside the verifier-round path, and park whatever
+   * depends on it. Used when the task cannot be judged at all — for example
+   * when its verification report never validated — so the run records the
+   * failure and moves on instead of holding the task in flight forever.
+   * A task that is already terminal is left as it is.
+   */
+  failTask(taskId: string, reason: string, data: Record<string, unknown> = {}): { failed: boolean; parkedDependents: string[] } {
+    const status = deriveSession(this.events()).tasks[taskId]?.status;
+    if (status === "COMPLETED" || status === "FAILED" || status === "DEADLETTER") {
+      return { failed: false, parkedDependents: [] };
+    }
+    appendEvent(this.runDir, {
+      type: "task.failed",
+      sessionId: this.sessionId,
+      taskId,
+      ts: this.now(),
+      data: { reason, ...data },
+    });
+    const parkedDependents = this.parkDependents(taskId);
+    this.closeIfDone();
+    this.snapshot();
+    return { failed: true, parkedDependents };
   }
 
   /**
