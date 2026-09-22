@@ -266,7 +266,7 @@ describe("no native structured outputs are requested anywhere", () => {
 
 describe("--no-budget (Phase 4b)", () => {
   test("parseCommandFlags recognises --no-budget", async () => {
-    const { parseCommandFlags } = await import("../src/index.ts");
+    const { parseCommandFlags } = await import("../src/flags.ts");
     const mint = () => "s1";
     expect(parseCommandFlags("--no-budget fix the bug", mint).budgetEnforced).toBe(false);
     expect(parseCommandFlags("fix the bug", mint).budgetEnforced).toBeUndefined();
@@ -275,7 +275,7 @@ describe("--no-budget (Phase 4b)", () => {
   });
 
   test("--no-budget warns that it overrides an explicit --budget", async () => {
-    const { parseCommandFlags } = await import("../src/index.ts");
+    const { parseCommandFlags } = await import("../src/flags.ts");
     const f = parseCommandFlags("--budget 30 --no-budget go", () => "s1");
     expect(f.budgetEnforced).toBe(false);
     expect(f.budgetUsd).toBe(30);
