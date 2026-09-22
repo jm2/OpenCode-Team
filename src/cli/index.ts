@@ -33,6 +33,7 @@ import {
   TEAM_ROLES,
   type ResolvedProviderModel,
 } from "./all-seats.js";
+import { parseJsonc } from "./jsonc.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -53,17 +54,14 @@ function resolveConfigPath(): string {
 function loadExistingConfig(path: string): Record<string, any> {
   if (!existsSync(path)) return {};
   try {
-    const raw = readFileSync(path, "utf-8");
-    // Strip comments for JSON.parse. Most users use JSONC, so we do
-    // a minimal pass: remove // line comments and /* block comments */.
-    const stripped = raw
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/^\s*\/\/.*$/gm, "")
-      .replace(/([^:])\/\/.*$/gm, "$1");
-    return JSON.parse(stripped);
+    // Most users write JSONC. Comments and trailing commas are stripped
+    // outside string literals only; see src/cli/jsonc.ts for what the old
+    // regexes did to URLs and glob patterns.
+    return parseJsonc<Record<string, any>>(readFileSync(path, "utf-8"));
   } catch (err) {
     console.error(`✗ Could not parse existing ${path}: ${(err as Error).message}`);
-    console.error("  Run with --reset to overwrite, or fix the file by hand.");
+    console.error("  Fix the file by hand, then re-run.");
+    console.error("  (--reset would replace the whole file, dropping your providers, MCP servers and other settings.)");
     process.exit(1);
   }
 }
