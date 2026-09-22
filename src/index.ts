@@ -209,7 +209,13 @@ export const TeamPlugin: Plugin = async (ctx) => {
      */
     "command.execute.before": async (input) => {
       if (!input.command.startsWith("teamwork") && !input.command.startsWith("team-")) return;
-      const flags = parseCommandFlags(input.arguments ?? "", () => {
+      // `opencode run --command teamwork "fix it --budget 5"` hands this hook
+      // the message wrapped in one pair of double quotes. Split as-is, the
+      // closing quote stuck to the last token: "5\"" parsed as NaN and the
+      // budget was dropped with a warning. Unwrap a single enclosing pair.
+      const rawArgs = (input.arguments ?? "").trim();
+      const args = /^"[^"]*"$/.test(rawArgs) ? rawArgs.slice(1, -1) : rawArgs;
+      const flags = parseCommandFlags(args, () => {
         const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("Z", "");
         return `${stamp}-${Math.random().toString(36).slice(2, 8)}`;
       });
