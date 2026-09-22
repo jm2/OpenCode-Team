@@ -21,6 +21,18 @@ import { homedir, platform, arch } from "node:os";
 import { createInterface, type Interface as RL } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { fileURLToPath } from "node:url";
+import {
+  ALL_SEATS_ENV,
+  allSeatsAgents,
+  findAlias,
+  findVendorModelStrings,
+  protocolFor,
+  resolveAlias,
+  singleModelRouting,
+  SINGLE_MODEL_ALIASES,
+  TEAM_ROLES,
+  type ResolvedProviderModel,
+} from "./all-seats.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -154,18 +166,7 @@ const PRESETS: Preset[] = [
   },
 ];
 
-const ROLES = [
-  "team/crafter",
-  "team/sentinel",
-  "team/worker",
-  "team/proof-worker",
-  "team/verifier",
-  "team/orchestrator",
-  "team/proposer",
-  "team/falsifier",
-  "team/synthesizer",
-  "team/scout",
-] as const;
+export const ROLES = TEAM_ROLES;
 
 // ─── Interactive prompts ─────────────────────────────────────────────
 
@@ -353,6 +354,94 @@ function ensurePluginListed(config: Record<string, any>, pkg: string): void {
   if (!config.plugin.includes(pkg)) config.plugin.push(pkg);
 }
 
+// ─── Single-model seat assignment (--all-seats / alias presets) ──────
+
+/** Read `--flag value` or `--flag=value`. Returns undefined when absent. */
+function flagValue(args: string[], flag: string): string | undefined {
+  const i = args.indexOf(flag);
+  if (i >= 0) return args[i + 1];
+  const inline = args.find((a) => a.startsWith(`${flag}=`));
+  return inline ? inline.slice(flag.length + 1) : undefined;
+}
+
+/**
+ * Resolve the model every seat should get, from `--all-seats <id>` or from an
+ * alias preset that looks the id up in the user's own config.
+ *
+ * Returns null when neither was requested, so the caller falls through to the
+ * ordinary preset path.
+ */
+function resolveAllSeats(
+  args: string[],
+  presetName: string | undefined,
+  configPath: string,
+): { modelId: string; source: string; resolved?: ResolvedProviderModel } | null {
+  const explicit = flagValue(args, "--all-seats");
+  if (explicit !== undefined) {
+    if (explicit.startsWith("--") || explicit === "") {
+      console.error(`✗ --all-seats needs a model id, e.g. --all-seats xiaomi/mimo-v2.6-pro`);
+      process.exit(1);
+    }
+    return { modelId: explicit, source: "--all-seats" };
+  }
+
+  const alias = presetName ? findAlias(presetName) : undefined;
+  if (!alias) return null;
+
+  // The alias is deliberately id-free: the config is the source of truth.
+  if (!existsSync(configPath)) {
+    console.error(`✗ preset "${alias.name}" needs an existing config to read the model id from.`);
+    console.error(`  No config at ${configPath}.`);
+    console.error(`  Configure the provider first, or pass the id directly:`);
+    console.error(`    opencode-teamwork install --all-seats <provider>/<model>`);
+    process.exit(1);
+  }
+  const existing = loadExistingConfig(configPath);
+  const result = resolveAlias(alias, existing, configPath);
+  if (!result.ok) {
+    console.error(`✗ ${result.error}`);
+    process.exit(1);
+  }
+  return { modelId: result.model.modelId, source: `preset ${alias.name}`, resolved: result.model };
+}
+
+/** Report what the resolver found, so the operator can confirm the id. */
+function reportResolvedModel(info: { modelId: string; source: string; resolved?: ResolvedProviderModel }): void {
+  console.log(`\n  Single-model baseline: every seat gets "${info.modelId}" (${info.source}).`);
+  const r = info.resolved;
+  if (!r) return;
+  const protocol = protocolFor(r.npm);
+  console.log(`    provider:  ${r.providerKey}${r.npm ? ` (npm: ${r.npm})` : ""}`);
+  if (r.displayName) console.log(`    name:      ${r.displayName}`);
+  if (r.baseURL) console.log(`    baseURL:   ${r.baseURL}`);
+  console.log(
+    `    protocol:  ${protocol === "unknown" ? "UNKNOWN — inspect the provider npm package by hand" : protocol}`,
+  );
+  if (r.reasoning !== undefined) {
+    console.log(`    reasoning: ${r.reasoning ? "on" : "off"} (model-level, so uniform across seats)`);
+  }
+}
+
+/**
+ * Assert the emitted patch is free of vendor model strings.
+ *
+ * A single vendor default in one seat silently invalidates a single-model
+ * baseline, and it is invisible in a 10-role diff. This prints the verdict
+ * rather than leaving the operator to eyeball it.
+ */
+function reportSeatPurity(patch: Record<string, any>, modelId: string): void {
+  const leaks = findVendorModelStrings(patch, modelId);
+  if (leaks.length === 0) {
+    const seats = Object.keys((patch.agent ?? {}) as Record<string, unknown>).length;
+    console.log(`\n  ✓ ${seats} seats, all "${modelId}". No vendor model strings in the patch.`);
+    return;
+  }
+  console.error(`\n  ✗ vendor model strings survived into the patch:`);
+  for (const l of leaks) console.error(`      ${l.path} = ${l.value}`);
+  console.error(`  This would invalidate a single-model baseline. Refusing.`);
+  process.exit(1);
+}
+
 // ─── Commands ────────────────────────────────────────────────────────
 
 async function cmdInstall(args: string[]): Promise<void> {
@@ -375,13 +464,23 @@ async function cmdInstall(args: string[]): Promise<void> {
   const pkg = "opencode-teamwork@latest";
 
   // ── 1. Choose the model assignment ────────────────────────────────
+  // `--all-seats <id>` and the alias presets short-circuit everything else:
+  // one model in every seat the installer writes, no vendor fall-through.
+  const allSeats = resolveAllSeats(args, presetName, configPath);
+
   let agents: Record<string, string>;
   try {
-    if (presetName) {
+    if (allSeats) {
+      reportResolvedModel(allSeats);
+      agents = allSeatsAgents(ROLES, allSeats.modelId);
+    } else if (presetName) {
       const preset = PRESETS.find((p) => p.name === presetName);
       if (!preset) {
         console.error(`✗ Unknown preset: ${presetName}`);
-        console.error(`  Available: ${PRESETS.map((p) => p.name).join(", ")}`);
+        console.error(
+          `  Available: ${[...PRESETS.map((p) => p.name), ...SINGLE_MODEL_ALIASES.map((a) => a.name)].join(", ")}`,
+        );
+        console.error(`  Or pin every seat to one model: --all-seats <provider>/<model>`);
         process.exit(1);
       }
       console.log(`\n  Preset: ${preset.name} — ${preset.description}`);
@@ -421,6 +520,7 @@ async function cmdInstall(args: string[]): Promise<void> {
   if (printOnly) {
     console.log(`\n  # Would write to ${configPath}:\n`);
     console.log(JSON.stringify(patch, null, 2).split("\n").map((l) => "  " + l).join("\n"));
+    if (allSeats) reportSeatPurity(patch, allSeats.modelId);
     return;
   }
 
@@ -471,6 +571,16 @@ async function cmdInstall(args: string[]): Promise<void> {
   console.log(`  Models:`);
   for (const [role, model] of Object.entries(agents)) {
     console.log(`    ${role.padEnd(28)} ${model}`);
+  }
+  if (allSeats) {
+    reportSeatPurity(patch, allSeats.modelId);
+    console.log(`\n  One more step for a clean single-model baseline:`);
+    console.log(`    export ${ALL_SEATS_ENV}="${allSeats.modelId}"`);
+    console.log(`  Upstream's routing policy carries Anthropic and Google model ladders that`);
+    console.log(`  teamwork_dispatch recommends to the sentinel per task. That variable pins`);
+    console.log(`  every ladder rung to your model. See docs/GROUND-TRUTH.md section 8.`);
+    console.log(`\n  Then verify the provider actually answers as a subagent:`);
+    console.log(`    scripts/smoke-delegation.sh`);
   }
   console.log(`\n  Next: opencode (the plugin loads automatically).`);
   console.log(`  Try:  /teamwork "your problem here"`);
@@ -577,7 +687,12 @@ Usage:
   opencode-teamwork --version
 
 Install options:
-  --preset <name>     Use a preset: ${PRESETS.map((p) => p.name).join(", ")}, or 'custom' for per-role
+  --all-seats <id>    Assign ONE model to every role the installer writes.
+                      Verbatim, no routing, no fall-through. For single-model
+                      baselines: opencode-teamwork install --all-seats xiaomi/mimo-v2.6-pro
+  --preset <name>     Use a preset: ${PRESETS.map((p) => p.name).join(", ")}
+                      Single-model aliases (model id read from YOUR config):
+${SINGLE_MODEL_ALIASES.map((a) => `                        ${a.name.padEnd(10)} ${a.description}`).join("\n")}
   --reset             Overwrite the existing config (no merge; warns + confirms)
   --dry-run           Print the config that would be written, then exit
   --print             Alias for --dry-run
@@ -596,6 +711,9 @@ rejected.
 Examples:
   opencode-teamwork install                              # interactive
   opencode-teamwork install --preset team                # use a preset
+  opencode-teamwork install --all-seats xiaomi/mimo-v2.6-pro   # one model, every seat
+  opencode-teamwork install --preset mimo                # same, id read from your config
+  opencode-teamwork install --print --all-seats <id>     # preview + vendor-leak check
   opencode-teamwork install --preset google --reset      # replace existing config
   opencode-teamwork install --yes                        # non-interactive (CI)
   opencode-teamwork install --dry-run                    # preview, never write

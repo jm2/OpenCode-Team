@@ -32,6 +32,7 @@ import { verifyChain, readEvents, deriveSession, writeSnapshot } from "./events.
 import { ENGINE_ROLES } from "./guard.js";
 import { DEFAULT_POLICY, TOPOLOGY_NAMES, type Policy } from "./policy.js";
 import { createWorktreeManager, runDirFor } from "./worktree.js";
+import { ALL_SEATS_ENV, singleModelRouting } from "./cli/all-seats.js";
 
 // ─── Shared helpers ──────────────────────────────────────────────────
 
@@ -43,19 +44,40 @@ export function mintSessionId(now = new Date()): string {
 
 export function loadPolicy(projectDir: string): Policy {
   const path = join(projectDir, ".teamwork", "policy.json");
-  if (!existsSync(path)) return DEFAULT_POLICY;
-  try {
-    const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<Policy>;
-    return {
-      ...DEFAULT_POLICY,
-      ...raw,
-      budget: { ...DEFAULT_POLICY.budget, ...(raw.budget ?? {}) },
-      routing: { ...DEFAULT_POLICY.routing, ...(raw.routing ?? {}) },
-      promptFragments: { ...DEFAULT_POLICY.promptFragments, ...(raw.promptFragments ?? {}) },
-    };
-  } catch {
-    return DEFAULT_POLICY;
+  let policy: Policy = DEFAULT_POLICY;
+  if (existsSync(path)) {
+    try {
+      const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<Policy>;
+      policy = {
+        ...DEFAULT_POLICY,
+        ...raw,
+        budget: { ...DEFAULT_POLICY.budget, ...(raw.budget ?? {}) },
+        routing: { ...DEFAULT_POLICY.routing, ...(raw.routing ?? {}) },
+        promptFragments: { ...DEFAULT_POLICY.promptFragments, ...(raw.promptFragments ?? {}) },
+      };
+    } catch {
+      policy = DEFAULT_POLICY;
+    }
   }
+  return applySingleModelPin(policy);
+}
+
+/**
+ * Pin every routing ladder to one model when a single-model baseline is active.
+ *
+ * Upstream's ladders carry Anthropic and Google ids, and `teamwork_dispatch`
+ * prints the resolved rung to the sentinel as the model to use for that task.
+ * That is advice rather than a routing decision, but recommending a vendor
+ * model into a seat is exactly what a single-model baseline must not do — and
+ * the escalate-on-failure behaviour would change models mid-run.
+ *
+ * Opt-in through the environment so the default path is byte-identical to
+ * upstream for everyone else.
+ */
+export function applySingleModelPin(policy: Policy): Policy {
+  const pinned = process.env[ALL_SEATS_ENV]?.trim();
+  if (!pinned) return policy;
+  return { ...policy, routing: singleModelRouting(pinned, policy.routing) };
 }
 
 function openRun(projectDir: string, sessionId: string): Engine {
