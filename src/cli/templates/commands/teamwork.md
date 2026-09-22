@@ -20,9 +20,10 @@ Do this:
 3. Pick one topology from the topology library in your context (use the
    parsed `--topology` if present). Read that topology's definition file
    before planning.
-4. Call `teamwork_plan` with the topology, the task list, and — when the user
-   passed them — `budgetUsd` and `maxConcurrency`. Every task needs
-   `acceptanceCriteria`, its real `dependsOn`, and a `taskClass`.
+4. Call `teamwork_plan` with the topology and the task list. The engine
+   applies the user's `--topology`, `--budget` and `--concurrency` and the
+   pre-parsed session id itself, and reports what it applied. Every task
+   needs `acceptanceCriteria`, its real `dependsOn`, and a `taskClass`.
 5. Loop: `teamwork_dispatch` → one `team/worker` per returned task → one
    `team/verifier` per task → `teamwork_verify` with the report path. Keep
    going until the engine reports nothing dispatchable.
