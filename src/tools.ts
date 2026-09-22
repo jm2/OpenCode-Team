@@ -103,7 +103,13 @@ function statusLine(engine: Engine): string {
   const parts = Object.entries(counts)
     .map(([k, v]) => `${v} ${k.toLowerCase()}`)
     .join(", ");
-  return `state=${s.state} tasks: ${parts || "none"} | rounds=${s.rounds} | cost=$${s.costUsd.toFixed(2)}/$${s.budgetUsd.toFixed(2)} (${s.pctOfBudget.toFixed(0)}%) | log=${s.chain.length} events, chain ${s.chain.ok ? "ok" : "BROKEN"}`;
+  // The cost figure is the sum of `costUsd` values the orchestrating model
+  // supplied — not metered tokens, not provider-reported usage. Labelled as
+  // an estimate so nobody reads it as a bill. See docs/GROUND-TRUTH.md §3.
+  const cap = engine.budgetEnforced
+    ? `/$${s.budgetUsd.toFixed(2)} (${s.pctOfBudget.toFixed(0)}%)`
+    : ` (no cap — budget enforcement disabled)`;
+  return `state=${s.state} tasks: ${parts || "none"} | rounds=${s.rounds} | est. cost~$${s.costUsd.toFixed(2)}${cap} [self-reported, not metered] | log=${s.chain.length} events, chain ${s.chain.ok ? "ok" : "BROKEN"}`;
 }
 
 function nextActions(engine: Engine): string {
@@ -131,6 +137,19 @@ function nextActions(engine: Engine): string {
 
 // ─── teamwork_plan ───────────────────────────────────────────────────
 
+/** `--no-budget` passthrough. Described here so the sentinel knows what the
+ *  figure it is capping actually is. */
+const tool_schemaBool = () =>
+  tool.schema
+    .boolean()
+    .optional()
+    .describe(
+      "default true. The budget sums costUsd values YOU supply to teamwork_verify — " +
+        "it is not metered tokens and not provider-reported usage, so on a subscription " +
+        "plan it corresponds to nothing billed. false disables the cap entirely.",
+    );
+
+
 const taskArg = tool.schema.object({
   taskId: tool.schema.string().describe("stable id, [A-Za-z0-9._-]{1,64}"),
   title: tool.schema.string(),
@@ -153,6 +172,7 @@ export const teamworkPlan: ToolDefinition = tool({
     sessionId: tool.schema.string().optional().describe("reuse an id to resume; omit to mint one"),
     budgetUsd: tool.schema.number().positive().optional(),
     maxConcurrency: tool.schema.number().int().positive().optional(),
+    budgetEnforced: tool_schemaBool(),
     worktrees: tool.schema.boolean().optional().describe("default true in a git repo"),
   },
   async execute(args, context) {
@@ -183,6 +203,7 @@ export const teamworkPlan: ToolDefinition = tool({
         policy,
         ...(args.budgetUsd !== undefined ? { budgetUsd: args.budgetUsd } : {}),
         ...(args.maxConcurrency !== undefined ? { maxConcurrency: args.maxConcurrency } : {}),
+        ...(args.budgetEnforced !== undefined ? { budgetEnforced: args.budgetEnforced } : {}),
         workingDirectory: context.directory,
       });
     } catch (err) {
@@ -274,7 +295,11 @@ export const teamworkPlan: ToolDefinition = tool({
     return [
       `run created: ${sessionId}`,
       `run dir: ${runDir}`,
-      `topology: ${args.topology} | concurrency cap: ${engine.maxConcurrency} | budget: $${engine.budgetUsd.toFixed(2)} (halt at ${engine.haltAtPct}%)`,
+      `topology: ${args.topology} | concurrency cap: ${engine.maxConcurrency} | ${
+        engine.budgetEnforced
+          ? `budget: $${engine.budgetUsd.toFixed(2)} — warns at ${engine.haltAtPct}%, refuses dispatch at 100%. This sums the costUsd values you report to teamwork_verify; it is an estimate, not metered usage.`
+          : `budget: DISABLED (--no-budget) — no cap gates dispatch`
+      }`,
       `waves: ${waves.map((w, i) => `[${i + 1}] ${w.join(" + ")}`).join("  ")}`,
       worktreeNotes.length > 0 ? `worktrees:\n  ${worktreeNotes.join("\n  ")}` : "",
       `specs written: ${tasks.map((t) => `spec-${t.taskId}.json`).join(", ")}`,

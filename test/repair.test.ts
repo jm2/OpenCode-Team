@@ -261,3 +261,89 @@ describe("no native structured outputs are requested anywhere", () => {
     expect(hits).toEqual([]);
   });
 });
+
+// ─── Phase 4b: budget enforcement is optional and honestly labelled ──
+
+describe("--no-budget (Phase 4b)", () => {
+  test("parseCommandFlags recognises --no-budget", async () => {
+    const { parseCommandFlags } = await import("../src/index.ts");
+    const mint = () => "s1";
+    expect(parseCommandFlags("--no-budget fix the bug", mint).budgetEnforced).toBe(false);
+    expect(parseCommandFlags("fix the bug", mint).budgetEnforced).toBeUndefined();
+    // The request text survives the flag.
+    expect(parseCommandFlags("--no-budget fix the bug", mint).request).toBe("fix the bug");
+  });
+
+  test("--no-budget warns that it overrides an explicit --budget", async () => {
+    const { parseCommandFlags } = await import("../src/index.ts");
+    const f = parseCommandFlags("--budget 30 --no-budget go", () => "s1");
+    expect(f.budgetEnforced).toBe(false);
+    expect(f.budgetUsd).toBe(30);
+    expect(f.warnings.join(" ")).toContain("overrides --budget");
+  });
+
+  test("an unenforced budget does not gate dispatch, and survives resume", async () => {
+    const { Engine } = await import("../src/engine.ts");
+    const dir = mkdtempSync(join(tmpdir(), "nobudget-"));
+    const runDir = join(dir, "run");
+    const e = Engine.create({
+      runDir,
+      sessionId: "nb",
+      topology: "small-focused",
+      tasks: [{ taskId: "t1", title: "one", maxRounds: 99 }],
+      budgetUsd: 0.01,
+      budgetEnforced: false,
+    });
+
+    e.recordRound({
+      taskId: "t1",
+      report: {
+        taskId: "t1",
+        verifierAgent: "v",
+        verifierModel: "m",
+        timestamp: new Date().toISOString(),
+        status: "FAIL",
+        checks: [{ name: "c", type: "programmatic", passed: false, cmd: "x", exitCode: 1 }],
+        feedbackForWorker: "",
+      },
+      costUsd: 99,
+    });
+
+    // Far past the cap, still dispatching.
+    expect(e.status().costUsd).toBe(99);
+    expect(e.budgetExhausted()).toBe(false);
+    expect(e.dispatchable(5).map((t) => t.taskId)).toEqual(["t1"]);
+    expect(e.events().some((ev) => ev.type === "budget.exhausted")).toBe(false);
+
+    // The setting is in the log, so a resumed run does not silently re-arm.
+    expect(Engine.resume(runDir).budgetEnforced).toBe(false);
+  });
+
+  test("enforcement is still the default", async () => {
+    const { Engine } = await import("../src/engine.ts");
+    const dir = mkdtempSync(join(tmpdir(), "budget-"));
+    const e = Engine.create({
+      runDir: join(dir, "run"),
+      sessionId: "b",
+      topology: "small-focused",
+      tasks: [{ taskId: "t1", title: "one", maxRounds: 99 }],
+      budgetUsd: 0.01,
+    });
+    expect(e.budgetEnforced).toBe(true);
+    e.recordRound({
+      taskId: "t1",
+      report: {
+        taskId: "t1",
+        verifierAgent: "v",
+        verifierModel: "m",
+        timestamp: new Date().toISOString(),
+        status: "FAIL",
+        checks: [{ name: "c", type: "programmatic", passed: false, cmd: "x", exitCode: 1 }],
+        feedbackForWorker: "",
+      },
+      costUsd: 1,
+    });
+    expect(e.budgetExhausted()).toBe(true);
+    expect(e.dispatchable(5)).toEqual([]);
+  });
+});

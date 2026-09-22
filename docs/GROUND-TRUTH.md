@@ -311,6 +311,77 @@ elsewhere in the codebase and are worth knowing about:
    missing from `opencode.json`, which `--all-seats` prevents.
 3. **`cost.ts` price table** — orphaned, see section 3.
 
+## 10. Phase 4 — what was verified, and what could not be
+
+**The orchestration loop was not run.** `/teamwork` needs opencode and a live
+provider; this machine has neither (§7.2). Everything below was checked by
+driving the engine directly against a scratch git repository containing a real
+off-by-one bug and a genuinely failing test. That covers every claim in the
+Phase 4 list except the ones that require a model, and it is the harness those
+claims are actually about.
+
+**16 of 18 checks passed. Both failures are §3.**
+
+| Claim | Result |
+|---|---|
+| Worktrees created under `.opencode/teamwork/<id>/` | PASS — `…/phase4/worktrees/agent-builder-fix`, branch `teamwork/agent-builder-fix-phase4`, registered with git |
+| Worktrees cleaned up | PASS — removed from disk and pruned from `git worktree list` |
+| A low `--budget` stops dispatch | PASS — at 120% of a $0.05 cap `dispatchable()` returned `[]` and `budget.exhausted` was logged. At 80% it did **not** stop, confirming §3 |
+| Verifier PASS means a command exited 0 | PASS — three ways, below |
+| `state.json` lets a killed run resume | PASS — resumed COMPLETED task and cost from the log; hash chain verified over 6 events; a tampered log was refused |
+| `costs.json` accumulates real numbers | **FAIL — `costs.json` is never written.** Run dir held `state.json`, `events.jsonl`, `plan.dag.json`, `worktrees` |
+| The budget cap fires when the model omits `costUsd` | **FAIL — 25 rounds against a $0.01 cap, cost stayed $0.00, dispatch never stopped** |
+
+The PASS-requires-evidence guarantee is the strongest thing in this codebase and
+it holds under adversarial input:
+
+- a rubric-only PASS ("looks correct to me") was rejected;
+- a PASS whose executed check recorded `exitCode: 1` was rejected;
+- a PASS was accepted only after the off-by-one was genuinely fixed and `bun
+  test` actually exited 0, with the stdout hash recorded.
+
+A model cannot talk its way past the verifier. That part of the README is true.
+
+## 11. Phase 4b — is cost tracking measuring anything real?
+
+**No. And the reason is worse than the subscription question.**
+
+The brief asked whether the numbers come from a per-token price table or from
+provider-reported usage. **Neither.** As established in §3, the only cost input
+is the `costUsd` argument the orchestrating model passes to `teamwork_verify`.
+It is optional, it defaults to zero, and nothing cross-checks it. The price
+table in `cost.ts` that *would* have made it a per-token estimate is orphaned
+and never runs.
+
+So the `--budget` guardrail is arithmetic over a model's self-report. That is
+true on pay-as-you-go and on a Token Plan subscription alike; the billing
+question changes how wrong the number is, not whether it is a measurement.
+
+**Which plan the key is on could not be determined** — there is no key, no
+config and no opencode install on this machine (§7.2). Pay-as-you-go and the
+Token Plan use different keys and different base URLs, so reading
+`provider.xiaomi.options.baseURL` and comparing it against Xiaomi's published
+endpoints will answer it in one look.
+
+**Both remedies were implemented**, because either alone would have been
+misleading:
+
+1. **Surfaced as an estimate.** Run output no longer prints a bare dollar
+   figure. `teamwork_status` and every status line now read
+   `est. cost~$0.00/$3.00 (0%) [self-reported, not metered]`, and
+   `teamwork_plan` states in full that the figure sums the values the sentinel
+   itself reports. The `teamwork_plan` tool description says the same thing to
+   the model.
+2. **`--no-budget` disables enforcement outright.** `/teamwork --no-budget …`
+   parses in code, is recorded in `session.start`, and survives resume so a
+   restarted run does not silently re-arm the cap. `dispatchable()` stops
+   consulting the budget and no `budget.exhausted` event is emitted. Enforcement
+   remains the default.
+
+Also corrected while in there: `teamwork_plan` used to print
+`budget: $20.00 (halt at 80%)`, which states the behaviour the feature table
+gets wrong. It now says it warns at 80% and refuses dispatch at 100%.
+
 ## 9. What changed in this fork
 
 Additive files, to keep the fork rebaseable:
@@ -329,3 +400,5 @@ Surgical edits to shared code, listed for re-application after an upstream merge
 | `src/cli/index.ts` | parse `--all-seats` / `--no-budget`; register the `mimo` preset; extend `--help` | Phase 1 entry point |
 | `src/tools.ts` | `teamwork_verify` routes boundary 1/2 through `repairArtifact`; `loadPolicy` honours `TEAMWORK_ALL_SEATS_MODEL` | Phase 2, and section 8 item 1 |
 | `src/engine.ts` | `budgetEnforced` flag so `--no-budget` disables the cap | Phase 4b |
+| `src/index.ts` | parse `--no-budget`; carry it on the run pointer | Phase 4b |
+| `src/tools.ts` | `budgetEnforced` arg on `teamwork_plan`; cost labelled as a self-reported estimate | Phase 4b |

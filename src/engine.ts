@@ -321,6 +321,17 @@ export interface EngineOptions {
   budgetUsd?: number;
   maxConcurrency?: number;
   haltAtPct?: number;
+  /**
+   * Whether the budget cap gates dispatch. Default true.
+   *
+   * The cap is arithmetic over `costUsd` values the orchestrating model
+   * supplies to `teamwork_verify` — not metered tokens and not provider-
+   * reported usage (docs/GROUND-TRUTH.md §3). On a subscription plan the
+   * figure corresponds to nothing that is billed. `--no-budget` turns the
+   * gate off rather than leaving a cap enforcing a number that does not
+   * mean what it looks like.
+   */
+  budgetEnforced?: boolean;
   workingDirectory?: string;
   now?: () => string;
 }
@@ -334,6 +345,7 @@ export class Engine {
   readonly budgetUsd: number;
   readonly maxConcurrency: number;
   readonly haltAtPct: number;
+  readonly budgetEnforced: boolean;
   readonly workingDirectory: string;
   private readonly now: () => string;
 
@@ -348,6 +360,7 @@ export class Engine {
       opts.budgetUsd ?? this.policy.budget.perSessionUsd ?? topo?.defaultMaxCostUsd ?? 20;
     this.maxConcurrency = opts.maxConcurrency ?? topo?.defaultConcurrency ?? 2;
     this.haltAtPct = opts.haltAtPct ?? this.policy.budget.haltAtPct ?? 80;
+    this.budgetEnforced = opts.budgetEnforced ?? true;
     this.workingDirectory = opts.workingDirectory ?? process.cwd();
     this.now = opts.now ?? (() => new Date().toISOString());
   }
@@ -374,6 +387,7 @@ export class Engine {
         topology: engine.topology,
         budgetUsd: engine.budgetUsd,
         haltAtPct: engine.haltAtPct,
+        budgetEnforced: engine.budgetEnforced,
         maxConcurrency: engine.maxConcurrency,
         workingDirectory: engine.workingDirectory,
         policyVersion: engine.policy.version,
@@ -457,6 +471,9 @@ export class Engine {
       ...(opts?.policy ? { policy: opts.policy } : {}),
       budgetUsd: derived.budgetUsd,
       haltAtPct: derived.haltAtPct,
+      ...(typeof startData.budgetEnforced === "boolean"
+        ? { budgetEnforced: startData.budgetEnforced }
+        : {}),
       ...(typeof startData.maxConcurrency === "number"
         ? { maxConcurrency: startData.maxConcurrency }
         : {}),
@@ -514,13 +531,14 @@ export class Engine {
 
   /** True when the budget cap (not the warning threshold) is reached. */
   budgetExhausted(): boolean {
+    if (!this.budgetEnforced) return false;
     const derived = deriveSession(this.events());
     return derived.budgetUsd > 0 && derived.costUsd >= derived.budgetUsd;
   }
 
   haltReason(): string | null {
     const derived = deriveSession(this.events());
-    if (derived.budgetUsd > 0 && derived.costUsd >= derived.budgetUsd) {
+    if (this.budgetEnforced && derived.budgetUsd > 0 && derived.costUsd >= derived.budgetUsd) {
       return `budget exhausted ($${derived.costUsd.toFixed(2)} of $${derived.budgetUsd.toFixed(2)})`;
     }
     const status = this.status();
@@ -542,7 +560,7 @@ export class Engine {
    */
   dispatchable(limit?: number): DagTask[] {
     const derived = deriveSession(this.events());
-    if (derived.budgetUsd > 0 && derived.costUsd >= derived.budgetUsd) {
+    if (this.budgetEnforced && derived.budgetUsd > 0 && derived.costUsd >= derived.budgetUsd) {
       appendEvent(this.runDir, {
         type: "budget.exhausted",
         sessionId: this.sessionId,

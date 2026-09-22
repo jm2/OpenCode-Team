@@ -33,6 +33,8 @@ export interface ParsedCommandFlags {
   topology?: string;
   budgetUsd?: number;
   maxConcurrency?: number;
+  /** False when `--no-budget` was passed. See docs/GROUND-TRUTH.md §3. */
+  budgetEnforced?: boolean;
   request: string;
   warnings: string[];
 }
@@ -50,6 +52,7 @@ export function parseCommandFlags(input: string, mint: () => string): ParsedComm
   let topology: string | undefined;
   let budgetUsd: number | undefined;
   let maxConcurrency: number | undefined;
+  let budgetEnforced: boolean | undefined;
 
   const valueOf = (token: string, flag: string, next: string | undefined): string | undefined => {
     if (token === flag) return next;
@@ -61,6 +64,14 @@ export function parseCommandFlags(input: string, mint: () => string): ParsedComm
     const token = tokens[i]!;
     const lookahead = tokens[i + 1];
     let consumed = false;
+
+    // Recorded cost is a figure the orchestrating model supplies, not metered
+    // usage, so a cap on it is notional. `--no-budget` turns the gate off
+    // rather than leaving it enforcing a number that means nothing.
+    if (token === "--no-budget") {
+      budgetEnforced = false;
+      continue;
+    }
 
     for (const [flag, assign] of [
       ["--topology", (v: string) => { topology = v; }],
@@ -93,12 +104,16 @@ export function parseCommandFlags(input: string, mint: () => string): ParsedComm
     warnings.push(`--concurrency must be a positive integer. Ignoring it.`);
     maxConcurrency = undefined;
   }
+  if (budgetEnforced === false && budgetUsd !== undefined) {
+    warnings.push(`--no-budget overrides --budget ${budgetUsd}; no cap will gate dispatch.`);
+  }
 
   return {
     ...(sessionId ? { sessionId } : { sessionId: mint() }),
     ...(topology ? { topology } : {}),
     ...(budgetUsd !== undefined ? { budgetUsd } : {}),
     ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+    ...(budgetEnforced !== undefined ? { budgetEnforced } : {}),
     request: rest.join(" ").trim(),
     warnings,
   };
@@ -109,6 +124,7 @@ interface RunPointer {
   topology?: string;
   budgetUsd?: number;
   maxConcurrency?: number;
+  budgetEnforced?: boolean;
   request?: string;
   createdAt: string;
   opencodeSessionID?: string;
@@ -226,6 +242,7 @@ export const TeamPlugin: Plugin = async (ctx) => {
         ...(flags.topology ? { topology: flags.topology } : {}),
         ...(flags.budgetUsd !== undefined ? { budgetUsd: flags.budgetUsd } : {}),
         ...(flags.maxConcurrency !== undefined ? { maxConcurrency: flags.maxConcurrency } : {}),
+        ...(flags.budgetEnforced !== undefined ? { budgetEnforced: flags.budgetEnforced } : {}),
         request: flags.request,
         createdAt: new Date().toISOString(),
         opencodeSessionID: input.sessionID,
