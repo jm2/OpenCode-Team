@@ -110,12 +110,10 @@ if (cmd === "config") {
   if (!path) { console.log(`ERROR\tno opencode config found (looked at: ${candidates.join(", ")})`); process.exit(0); }
   let cfg; try { cfg = jsonc(readFileSync(path, "utf8")); } catch (e) { console.log(`ERROR\tcannot parse ${path}: ${e.message}`); process.exit(0); }
   const seats = [...new Set(Object.entries(cfg.agent ?? {}).filter(([k]) => k.startsWith("team/")).map(([, v]) => v?.model).filter(Boolean))];
-  let model = wantModel;
-  if (!model) {
-    if (seats.length > 1) { console.log(`ERROR\tthe team/* seats are not all on one model: ${seats.join(", ")}`); process.exit(0); }
-    model = seats[0] || cfg.model;
-  }
-  if (!model) { console.log(`ERROR\tno model: pass --model, or install with --all-seats`); process.exit(0); }
+  // Every distinct seat model is checked: the subagent failure is per provider.
+  const models = wantModel ? [wantModel] : seats.length > 0 ? seats : cfg.model ? [cfg.model] : [];
+  if (models.length === 0) { console.log(`ERROR\tno model: pass --model, or install with --all-seats or --strong/--fast`); process.exit(0); }
+  const model = models.join(",");
   const isTeamwork = (p) => {
     if (typeof p !== "string") return false;
     if (p === "opencode-teamwork" || p.startsWith("opencode-teamwork@")) return true;
@@ -125,7 +123,7 @@ if (cmd === "config") {
     return false;
   };
   const plugins = (Array.isArray(cfg.plugin) ? cfg.plugin : []).filter(isTeamwork);
-  console.log(["OK", path, model, plugins.join(" ") || "-", seats.length === 1 ? "pinned" : "unpinned"].join("\t"));
+  console.log(["OK", path, model, plugins.join(" ") || "-", seats.length > 0 ? "seats" : "default"].join("\t"));
 } else if (cmd === "describe") {
   // stdin: `opencode models <provider> --verbose`; a: [model]
   const text = readFileSync(0, "utf8").split(/\r?\n/);
@@ -174,13 +172,13 @@ IFS=$'\t' read -r STATUS CFG_PATH_OR_ERR RESOLVED_MODEL PLUGINS SEATS <<EOF
 $("$RUNTIME" "$HELPER" config "$CONFIG" "$MODEL")
 EOF
 [ "$STATUS" = "OK" ] || die_setup "$CFG_PATH_OR_ERR"
-MODEL="$RESOLVED_MODEL"
+MODELS="$(printf '%s' "$RESOLVED_MODEL" | tr ',' ' ')"
 ok "config: $CFG_PATH_OR_ERR"
-ok "model:  $MODEL$([ "$SEATS" = pinned ] && printf ' (every team/* seat)' || printf ' (team/* seats not all set — the default model)')"
+ok "models: $MODELS$([ "$SEATS" = seats ] && printf ' (the team/* seats)' || printf ' (no team/* seats set: the default model)')"
 
 case "$PLUGINS" in
   -) die_setup "opencode-teamwork is not in the config's plugin list. Install it:
-     opencode-teamwork install --all-seats $MODEL --plugin local" ;;
+     opencode-teamwork install --all-seats <provider/model> --plugin local" ;;
   file://*) ok "plugin: $PLUGINS" ;;
   *) warn "plugin: $PLUGINS from npm. No npm release has this fork's metering, so checks"
      info "C and D will fail on missing telemetry. Use --plugin local when installing." ;;
@@ -197,14 +195,17 @@ with_timeout() {
   fi
 }
 
-PROVIDER="${MODEL%%/*}"
-IFS=$'\t' read -r D_STATUS PROTOCOL NPM URL BILLING REASONING INTERLEAVED <<EOF
-$(with_timeout 120 opencode models "$PROVIDER" --verbose </dev/null 2>/dev/null | "$RUNTIME" "$HELPER" describe "$MODEL")
+describe_model() {
+  local model="$1" provider="${1%%/*}"
+  IFS=$'\t' read -r D_STATUS PROTOCOL NPM URL BILLING REASONING INTERLEAVED <<EOF
+$(with_timeout 120 opencode models "$provider" --verbose </dev/null 2>/dev/null | "$RUNTIME" "$HELPER" describe "$model")
 EOF
-[ "$D_STATUS" = "OK" ] || die_setup "opencode does not list $MODEL (check: opencode models $PROVIDER). Credentials missing, or a typo in the id."
-if [ "$PROTOCOL" = "unknown" ]; then warn "protocol: UNKNOWN (npm package: $NPM)"; else ok "protocol: $PROTOCOL ($NPM)"; fi
-info "endpoint: $URL  [$BILLING]"
-info "reasoning: $REASONING$([ "$INTERLEAVED" != "-" ] && printf ', interleaved via %s' "$INTERLEAVED")"
+  [ "$D_STATUS" = "OK" ] || die_setup "opencode does not list $model (check: opencode models $provider). Credentials missing, or a typo in the id."
+  if [ "$PROTOCOL" = "unknown" ]; then warn "$model protocol: UNKNOWN (npm package: $NPM)"; else ok "$model: $PROTOCOL protocol ($NPM)"; fi
+  info "endpoint: $URL$([ "$BILLING" != unknown ] && printf '  [%s]' "$BILLING")"
+  info "reasoning: $REASONING$([ "$INTERLEAVED" != "-" ] && printf ', interleaved via %s' "$INTERLEAVED")"
+}
+for m in $MODELS; do describe_model "$m"; done
 
 TELE="$WORKDIR/telemetry.jsonl"
 export TEAMWORK_TELEMETRY_FILE="$TELE"
@@ -232,66 +233,70 @@ texts() { "$RUNTIME" "$HELPER" texts "$WORKDIR/$1.json"; }
 
 SCRATCH="$WORKDIR/scratch"; mkdir -p "$SCRATCH"
 
-# ─── A. primary ──────────────────────────────────────────────────────
+for MODEL in $MODELS; do
+  TAG="$(printf '%s' "$MODEL" | tr '/:.' '___')"
+  describe_model "$MODEL" >/dev/null
+  # ─── A. primary ──────────────────────────────────────────────────────
 
-head_ "A. Does the model answer as the PRIMARY agent?"
-BEFORE=$(tele_count)
-oc_run primary "$SCRATCH" -m "$MODEL" "Reply with the words BLUE and FALCON joined by an underscore, in capitals, and nothing else."
-PRIMARY=$("$RUNTIME" "$HELPER" tele "$TELE" "$BEFORE" primary)
-if [ "$(cat "$WORKDIR/primary.rc")" = "124" ] && [ "$(tele_count)" = "$BEFORE" ]; then
-  die_setup "opencode timed out before making any model call (see above), so nothing could be checked."
-fi
-if [ "$(tele_count)" = "$BEFORE" ]; then
-  die_setup "no model call was recorded. The teamwork plugin did not load, or the loaded build has
-   no usage observer (npm 0.2.1 and upstream builds do not). Look for 'failed to load plugin' in:
-     opencode run --print-logs \"hi\"
-   and install this checkout:  opencode-teamwork install --all-seats $MODEL --plugin local"
-fi
-A_ERR=$(printf '%s\n' "$PRIMARY" | awk -F'\t' '$6 != "-" {print $6; exit}')
-A_OTHER=$(printf '%s\n' "$PRIMARY" | awk -F'\t' -v m="$MODEL" 'tolower($2) != tolower(m) {print $2; exit}')
-A_REASON=$(printf '%s\n' "$PRIMARY" | awk -F'\t' '$4 > 0 {r=1} END {print r ? "yes" : "no"}')
-if [ -n "$A_ERR" ]; then fail "provider error as primary: $A_ERR"
-elif [ -n "$A_OTHER" ]; then fail "the primary call was served by $A_OTHER, not $MODEL"
-else
-  ok "answered as primary over $PROTOCOL (recorded by opencode; reasoning tokens: $A_REASON)"
-  texts primary | grep -q "BLUE_FALCON" || warn "it answered, but not with BLUE_FALCON: $(texts primary | head -c 120)"
-fi
-
-# ─── B. tool calling ─────────────────────────────────────────────────
-
-head_ "B. Does it CALL TOOLS as the primary agent?"
-PROBE="$SCRATCH/tool-probe.txt"
-oc_run tools "$SCRATCH" -m "$MODEL" "Use your file writing tool to create the file $PROBE containing exactly the word CALLED. Do not print it."
-if [ -f "$PROBE" ] && grep -q "CALLED" "$PROBE"; then ok "a tool call over $PROTOCOL reached the filesystem"
-else fail "no tool call reached the filesystem: $PROBE was not written"; fi
-
-# ─── C. subagent ─────────────────────────────────────────────────────
-
-head_ "C. Does it answer as a SUBAGENT through the task tool?"
-NONCE="nonce-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
-printf '%s\n' "$NONCE" > "$SCRATCH/nonce.txt"
-BEFORE=$(tele_count)
-oc_run subagent "$SCRATCH" -m "$MODEL" "Use the task tool to start a general subagent. Tell it to read the file $SCRATCH/nonce.txt and reply with the file's exact contents. Do not read the file yourself. When it returns, repeat its reply."
-SUB=$("$RUNTIME" "$HELPER" tele "$TELE" "$BEFORE" sub)
-if [ -z "$SUB" ]; then
-  fail "no subagent call was recorded: the model never used the task tool, so delegation is untested"
-else
-  C_ERR=$(printf '%s\n' "$SUB" | awk -F'\t' '$6 != "-" {print $6 "\t" $7; exit}')
-  C_OTHER=$(printf '%s\n' "$SUB" | awk -F'\t' -v m="$MODEL" 'tolower($2) != tolower(m) {print $1 " on " $2; exit}')
-  if [ -n "$C_ERR" ]; then
-    fail "PROVIDER ERROR IN THE SUBAGENT — the known delegation failure:"
-    info "$(printf '%s\n' "$C_ERR" | cut -f1)"
-    info "response body: $(printf '%s\n' "$C_ERR" | cut -f2)"
-    info "It works as primary but not as a subagent, so no teamwork run can succeed."
-  elif [ -n "$C_OTHER" ]; then
-    fail "the subagent ran as $C_OTHER, not $MODEL"
-  else
-    ok "a subagent answered over $PROTOCOL (a recorded child-session call)"
-    texts subagent | grep -q "$NONCE" && info "and its answer reached the parent" || warn "the parent did not repeat the subagent's answer"
-    C_REASON=$(printf '%s\n' "$SUB" | awk -F'\t' '$4 > 0 {r=1} END {print r ? "yes" : "no"}')
-    [ "$C_REASON" = "$A_REASON" ] || warn "reasoning differs: primary $A_REASON, subagent $C_REASON. Seats may not be thinking alike."
+  head_ "A. Does $MODEL answer as the PRIMARY agent?"
+  BEFORE=$(tele_count)
+  oc_run "primary-$TAG" "$SCRATCH" -m "$MODEL" "Reply with the words BLUE and FALCON joined by an underscore, in capitals, and nothing else."
+  PRIMARY=$("$RUNTIME" "$HELPER" tele "$TELE" "$BEFORE" primary)
+  if [ "$(cat "$WORKDIR/primary-$TAG.rc")" = "124" ] && [ "$(tele_count)" = "$BEFORE" ]; then
+    die_setup "opencode timed out before making any model call (see above), so nothing could be checked."
   fi
-fi
+  if [ "$(tele_count)" = "$BEFORE" ]; then
+    die_setup "no model call was recorded. The teamwork plugin did not load, or the loaded build has
+     no usage observer (npm 0.2.1 and upstream builds do not). Look for 'failed to load plugin' in:
+       opencode run --print-logs \"hi\"
+     and install this checkout:  opencode-teamwork install --all-seats $MODEL --plugin local"
+  fi
+  A_ERR=$(printf '%s\n' "$PRIMARY" | awk -F'\t' '$6 != "-" {print $6; exit}')
+  A_OTHER=$(printf '%s\n' "$PRIMARY" | awk -F'\t' -v m="$MODEL" 'tolower($2) != tolower(m) {print $2; exit}')
+  A_REASON=$(printf '%s\n' "$PRIMARY" | awk -F'\t' '$4 > 0 {r=1} END {print r ? "yes" : "no"}')
+  if [ -n "$A_ERR" ]; then fail "provider error as primary: $A_ERR"
+  elif [ -n "$A_OTHER" ]; then fail "the primary call was served by $A_OTHER, not $MODEL"
+  else
+    ok "answered as primary over $PROTOCOL (recorded by opencode; reasoning tokens: $A_REASON)"
+    texts "primary-$TAG" | grep -q "BLUE_FALCON" || warn "it answered, but not with BLUE_FALCON: $(texts "primary-$TAG" | head -c 120)"
+  fi
+
+  # ─── B. tool calling ─────────────────────────────────────────────────
+
+  head_ "B. Does $MODEL CALL TOOLS as the primary agent?"
+  PROBE="$SCRATCH/tool-probe-$TAG.txt"
+  oc_run "tools-$TAG" "$SCRATCH" -m "$MODEL" "Use your file writing tool to create the file $PROBE containing exactly the word CALLED. Do not print it."
+  if [ -f "$PROBE" ] && grep -q "CALLED" "$PROBE"; then ok "a tool call over $PROTOCOL reached the filesystem"
+  else fail "no tool call reached the filesystem: $PROBE was not written"; fi
+
+  # ─── C. subagent ─────────────────────────────────────────────────────
+
+  head_ "C. Does $MODEL answer as a SUBAGENT through the task tool?"
+  NONCE="nonce-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  printf '%s\n' "$NONCE" > "$SCRATCH/nonce-$TAG.txt"
+  BEFORE=$(tele_count)
+  oc_run "subagent-$TAG" "$SCRATCH" -m "$MODEL" "Use the task tool to start a general subagent. Tell it to read the file $SCRATCH/nonce-$TAG.txt and reply with the file's exact contents. Do not read the file yourself. When it returns, repeat its reply."
+  SUB=$("$RUNTIME" "$HELPER" tele "$TELE" "$BEFORE" sub)
+  if [ -z "$SUB" ]; then
+    fail "no subagent call was recorded: the model never used the task tool, so delegation is untested"
+  else
+    C_ERR=$(printf '%s\n' "$SUB" | awk -F'\t' '$6 != "-" {print $6 "\t" $7; exit}')
+    C_OTHER=$(printf '%s\n' "$SUB" | awk -F'\t' -v m="$MODEL" 'tolower($2) != tolower(m) {print $1 " on " $2; exit}')
+    if [ -n "$C_ERR" ]; then
+      fail "PROVIDER ERROR IN THE SUBAGENT — the known delegation failure:"
+      info "$(printf '%s\n' "$C_ERR" | cut -f1)"
+      info "response body: $(printf '%s\n' "$C_ERR" | cut -f2)"
+      info "It works as primary but not as a subagent, so no teamwork run can succeed."
+    elif [ -n "$C_OTHER" ]; then
+      fail "the subagent ran as $C_OTHER, not $MODEL"
+    else
+      ok "a subagent answered over $PROTOCOL (a recorded child-session call)"
+      texts "subagent-$TAG" | grep -q "$NONCE" && info "and its answer reached the parent" || warn "the parent did not repeat the subagent's answer"
+      C_REASON=$(printf '%s\n' "$SUB" | awk -F'\t' '$4 > 0 {r=1} END {print r ? "yes" : "no"}')
+      [ "$C_REASON" = "$A_REASON" ] || warn "reasoning differs: primary $A_REASON, subagent $C_REASON. Seats may not be thinking alike."
+    fi
+  fi
+done
 
 # ─── D. the plugin's own engine ──────────────────────────────────────
 
@@ -303,7 +308,7 @@ else
   (cd "$REPO" && git init -q && git config user.email smoke@example.invalid && git config user.name smoke &&
    printf 'x\n' > f && git add -A && git commit -qm init)
   oc_run dispatch "$REPO" --command teamwork "Smoke test of the run engine only; change no files and ask no questions. Call teamwork_plan with topology small-focused, worktrees false, and one task: taskId smoke, title smoke check. Then call teamwork_dispatch. Then run the shell command true and call teamwork_verify for taskId smoke with status PASS and one programmatic check named smoke with cmd true and exitCode 0. Then stop. --budget 1"
-  IFS=$'\t' read -r RUN_DIR TYPES USAGE MODELS BUDGET <<EOF
+  IFS=$'\t' read -r RUN_DIR TYPES USAGE RUN_MODELS BUDGET <<EOF
 $("$RUNTIME" "$HELPER" run "$REPO")
 EOF
   if [ "$RUN_DIR" = "NONE" ]; then
@@ -317,9 +322,9 @@ EOF
     else ok "plan, dispatch, verify, completed: all in the hash-chained log"; fi
     if [ "$USAGE" -gt 0 ]; then ok "$USAGE model calls metered into the run"
     else fail "nothing was metered into the run: the budget would fall back to self-reported cost"; fi
-    if [ -n "$MODELS" ] && [ "$(printf '%s' "$MODELS" | tr ',' '\n' | awk -v m="$MODEL" 'tolower($0) != tolower(m)' | head -1)" != "" ]; then
-      fail "SEAT LEAK: the run used $MODELS, not only $MODEL"
-    elif [ -n "$MODELS" ]; then ok "every model call in the run was on $MODEL"; fi
+    if [ -n "$RUN_MODELS" ] && [ "$(printf '%s' "$RUN_MODELS" | tr ',' '\n' | while read -r rm; do case " $MODELS " in *" $rm "*) ;; *) echo "$rm" ;; esac; done | head -1)" != "" ]; then
+      fail "the run used $RUN_MODELS, which includes a model no seat is configured for ($MODELS)"
+    elif [ -n "$RUN_MODELS" ]; then ok "every model call in the run was on a configured seat model ($RUN_MODELS)"; fi
     [ "$BUDGET" = "1" ] && ok "--budget 1 reached the engine" || fail "--budget 1 did not reach the engine (it started at $BUDGET)"
   fi
 fi
@@ -333,6 +338,6 @@ if [ "$FAILURES" -gt 0 ]; then
   exit 1
 fi
 printf '  %s\n' "$(green '✓ All delegation checks passed.')"
-info "model: $MODEL | protocol: $PROTOCOL | endpoint: $BILLING"
-info "This is evidence for the $PROTOCOL protocol only."
+info "models: $MODELS"
+info "This is evidence for each model's configured protocol only."
 exit 0

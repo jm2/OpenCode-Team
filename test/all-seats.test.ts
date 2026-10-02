@@ -152,7 +152,7 @@ describe("the emitted patch is vendor-free (the Phase 1 guarantee)", () => {
     for (const s of ["anthropic/", "openai/", "google/", "claude-", "gpt-", "gemini-"]) {
       expect(out).not.toContain(s);
     }
-    expect(out).toContain("No vendor model strings in the patch");
+    expect(out).toContain("No other model strings in the patch");
   });
 
   test("an upstream preset still fails the same check (the test can fail)", () => {

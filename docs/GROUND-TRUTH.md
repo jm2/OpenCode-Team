@@ -22,7 +22,9 @@
 > - **Phase 2 repair loop:** exhaustion now fails the task instead of wedging
 >   the run; raw evidence is no longer overwritten across rounds.
 > - **Phase 3 smoke test:** rewritten on recorded evidence; verified against
->   real opencode with a scripted fake provider.
+>   real opencode with a scripted fake provider. It checks every distinct
+>   seat model as primary, with tools, and as a subagent.
+> - **Two-model teams** are supported; see §12.
 
 Audit of the code at `281821a` (v0.3.0), written for a single-model baseline
 experiment. Everything below was read out of `src/`, and the behavioural claims
@@ -430,6 +432,29 @@ and `fix/budget-halt-message` all touch `src/tools.ts`, and the last also
 touches the budget messaging this fork rewrote in §11. `fix/cli-preset-menu`
 touches `src/cli/index.ts` near the `--all-seats` wiring. Taking the upstream
 versions first and re-applying §9's list on top is the cleaner order.
+
+## 12. Two-model teams: MiMo Pro plus DeepSeek V4.1 Flash
+
+`opencode-teamwork install --strong <id> --fast <id>` assigns each seat from
+`SEAT_TIERS` in `src/cli/all-seats.ts`; `--seat <role>=<model>` overrides any
+seat, in any mode. opencode 1.18.32's bundled catalog lists DeepSeek V4.1
+Flash as `deepseek/deepseek-flash` (the id does not say 4.1), OpenAI protocol
+at `api.deepseek.com`, $0.15 in / $0.60 out per 1M tokens. MiMo V2.6 Pro is
+$0.435 / $0.87. Confirm both with `opencode models <provider> --verbose`.
+
+The gap is small: about 2.9x on input and 1.5x on output. A seat that writes
+or judges code costs more in one extra round than Flash saves, so Flash takes
+only the verifier (the engine refuses a PASS without real exit codes), the
+scout (input-heavy reading) and the proposer (filtered by a strong falsifier
+and synthesizer). The worker stays on Pro; whether Flash workers pay off is
+an empirical question, answerable per run from `costs.json` and the rounds
+per task: run the same tasks with `--seat worker=deepseek/deepseek-flash`.
+
+opencode's task tool takes no model, so a subagent always runs on its agent's
+configured model and per-call escalation is not possible through it. The
+routing policy's ladder was always advisory; with seat models known, dispatch
+now names the worker seat's configured model instead, and `teamwork_status`
+flags any seat that ran on a model other than its configured one.
 
 ## 9. What changed in this fork
 

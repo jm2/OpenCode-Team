@@ -1,0 +1,248 @@
+deepseek/deepseek-flash
+{
+  "id": "deepseek-flash",
+  "providerID": "deepseek",
+  "name": "DeepSeek V4.1 Flash",
+  "family": "deepseek-flash",
+  "api": {
+    "id": "deepseek-flash",
+    "url": "https://api.deepseek.com",
+    "npm": "@ai-sdk/openai-compatible"
+  },
+  "status": "active",
+  "headers": {},
+  "options": {},
+  "cost": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache": {
+      "read": 0.003,
+      "write": 0
+    }
+  },
+  "limit": {
+    "context": 1000000,
+    "output": 384000
+  },
+  "capabilities": {
+    "temperature": true,
+    "reasoning": true,
+    "attachment": true,
+    "toolcall": true,
+    "input": {
+      "text": true,
+      "audio": false,
+      "image": true,
+      "video": false,
+      "pdf": false
+    },
+    "output": {
+      "text": true,
+      "audio": false,
+      "image": false,
+      "video": false,
+      "pdf": false
+    },
+    "interleaved": {
+      "field": "reasoning_content"
+    }
+  },
+  "release_date": "2026-09-10",
+  "variants": {
+    "low": {
+      "reasoningEffort": "low"
+    },
+    "high": {
+      "reasoningEffort": "high"
+    },
+    "max": {
+      "reasoningEffort": "max"
+    }
+  }
+}
+deepseek/deepseek-v4-flash
+{
+  "id": "deepseek-v4-flash",
+  "providerID": "deepseek",
+  "name": "DeepSeek V4 Flash",
+  "family": "deepseek-flash",
+  "api": {
+    "id": "deepseek-v4-flash",
+    "url": "https://api.deepseek.com",
+    "npm": "@ai-sdk/openai-compatible"
+  },
+  "status": "active",
+  "headers": {},
+  "options": {},
+  "cost": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache": {
+      "read": 0.003,
+      "write": 0
+    }
+  },
+  "limit": {
+    "context": 1000000,
+    "output": 384000
+  },
+  "capabilities": {
+    "temperature": true,
+    "reasoning": true,
+    "attachment": true,
+    "toolcall": true,
+    "input": {
+      "text": true,
+      "audio": false,
+      "image": true,
+      "video": false,
+      "pdf": false
+    },
+    "output": {
+      "text": true,
+      "audio": false,
+      "image": false,
+      "video": false,
+      "pdf": false
+    },
+    "interleaved": {
+      "field": "reasoning_content"
+    }
+  },
+  "release_date": "2026-09-10",
+  "variants": {
+    "low": {
+      "reasoningEffort": "low"
+    },
+    "high": {
+      "reasoningEffort": "high"
+    },
+    "max": {
+      "reasoningEffort": "max"
+    }
+  }
+}
+deepseek/deepseek-v4-flash-vision-exp
+{
+  "id": "deepseek-v4-flash-vision-exp",
+  "providerID": "deepseek",
+  "name": "DeepSeek V4 Flash Vision Exp",
+  "family": "deepseek-flash",
+  "api": {
+    "id": "deepseek-v4-flash-vision-exp",
+    "url": "https://api.deepseek.com",
+    "npm": "@ai-sdk/openai-compatible"
+  },
+  "status": "active",
+  "headers": {},
+  "options": {},
+  "cost": {
+    "input": 0.15,
+    "output": 0.6,
+    "cache": {
+      "read": 0.003,
+      "write": 0
+    }
+  },
+  "limit": {
+    "context": 1000000,
+    "output": 384000
+  },
+  "capabilities": {
+    "temperature": true,
+    "reasoning": true,
+    "attachment": true,
+    "toolcall": true,
+    "input": {
+      "text": true,
+      "audio": false,
+      "image": true,
+      "video": false,
+      "pdf": false
+    },
+    "output": {
+      "text": true,
+      "audio": false,
+      "image": false,
+      "video": false,
+      "pdf": false
+    },
+    "interleaved": {
+      "field": "reasoning_content"
+    }
+  },
+  "release_date": "2026-09-10",
+  "variants": {
+    "low": {
+      "reasoningEffort": "low"
+    },
+    "high": {
+      "reasoningEffort": "high"
+    },
+    "max": {
+      "reasoningEffort": "max"
+    }
+  }
+}
+deepseek/deepseek-v4-pro
+{
+  "id": "deepseek-v4-pro",
+  "providerID": "deepseek",
+  "name": "DeepSeek V4 Pro",
+  "family": "deepseek-thinking",
+  "api": {
+    "id": "deepseek-v4-pro",
+    "url": "https://api.deepseek.com",
+    "npm": "@ai-sdk/openai-compatible"
+  },
+  "status": "active",
+  "headers": {},
+  "options": {},
+  "cost": {
+    "input": 0.435,
+    "output": 0.87,
+    "cache": {
+      "read": 0.003625,
+      "write": 0
+    }
+  },
+  "limit": {
+    "context": 1000000,
+    "output": 384000
+  },
+  "capabilities": {
+    "temperature": true,
+    "reasoning": true,
+    "attachment": false,
+    "toolcall": true,
+    "input": {
+      "text": true,
+      "audio": false,
+      "image": false,
+      "video": false,
+      "pdf": false
+    },
+    "output": {
+      "text": true,
+      "audio": false,
+      "image": false,
+      "video": false,
+      "pdf": false
+    },
+    "interleaved": {
+      "field": "reasoning_content"
+    }
+  },
+  "release_date": "2026-08-12",
+  "variants": {
+    "low": {
+      "reasoningEffort": "low"
+    },
+    "high": {
+      "reasoningEffort": "high"
+    },
+    "max": {
+      "reasoningEffort": "max"
+    }
+  }
+}

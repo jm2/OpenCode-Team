@@ -29,6 +29,7 @@ import { getAllCommands, agentConfigs } from "./templates.js";
 import { TEAMWORK_TOOLS } from "./tools.js";
 import { readRunPointer, writeRunPointer } from "./run-pointer.js";
 import { TELEMETRY_ENV, UsageObserver } from "./telemetry.js";
+import { recordSeatModels } from "./seat-models.js";
 import { runDirFor } from "./worktree.js";
 // Command-flag parsing lives in ./flags.ts; see the export note at the end of this file.
 
@@ -83,6 +84,8 @@ export const TeamPlugin: Plugin = async (ctx) => {
           },
         );
       }
+
+      recordSeatModels(config.agent as Record<string, unknown>);
 
       config.command = config.command ?? {};
       for (const cmd of getAllCommands()) {

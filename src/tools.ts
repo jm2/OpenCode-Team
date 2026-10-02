@@ -34,7 +34,8 @@ import { DEFAULT_POLICY, TOPOLOGY_NAMES, type Policy } from "./policy.js";
 import { pointerFor, type RunPointer } from "./run-pointer.js";
 import { createWorktreeManager, runDirFor } from "./worktree.js";
 import { ALL_SEATS_ENV, singleModelRouting } from "./single-model.js";
-import { INTERNAL_AGENTS, readUsage, seatLeaks, summarize } from "./telemetry.js";
+import { INTERNAL_AGENTS, readUsage, seatLeaks, seatMismatches, summarize } from "./telemetry.js";
+import { seatModel, seatModels } from "./seat-models.js";
 import { repairArtifact, VERIFICATION_REPORT_HINT } from "./repair.js";
 
 // ─── Shared helpers ──────────────────────────────────────────────────
@@ -146,7 +147,11 @@ function statusLine(engine: Engine): string {
  * What the usage observer recorded for this run: the evidence that every seat
  * ran on one model, whether reasoning was uniform, and any provider errors.
  */
-export function usageReport(runDir: string, pinned = process.env[ALL_SEATS_ENV]?.trim()): string[] {
+export function usageReport(
+  runDir: string,
+  pinned = process.env[ALL_SEATS_ENV]?.trim(),
+  expected: Record<string, string> = seatModels(),
+): string[] {
   const records = readUsage(runDir);
   if (records.length === 0) return ["usage: nothing metered for this run yet"];
   const u = summarize(records);
@@ -161,7 +166,16 @@ export function usageReport(runDir: string, pinned = process.env[ALL_SEATS_ENV]?
         ? `  seats: every seat ran on ${pinned}`
         : `  SEAT LEAK: ${leaks.map((l) => `${l.agent} ran on ${l.model}`).join("; ")} (pinned: ${pinned})`,
     );
+  } else if (Object.keys(expected).length > 0) {
+    const off = seatMismatches(u, expected);
+    lines.push(
+      off.length === 0
+        ? `  seats: every seat that ran used its configured model`
+        : `  SEAT MISMATCH: ${off.map((m) => `${m.agent} ran on ${m.model}, configured ${m.expected}`).join("; ")}`,
+    );
   }
+  const spend = Object.entries(u.byModel).map(([m, v]) => `${m} $${v.costUsd.toFixed(4)}`);
+  if (spend.length > 1) lines.push(`  spend by model: ${spend.join(", ")}`);
   const seats = Object.entries(u.byAgent).filter(([a]) => !INTERNAL_AGENTS.includes(a));
   if (seats.length > 0) {
     lines.push(
@@ -485,7 +499,11 @@ export const teamworkDispatch: ToolDefinition = tool({
     const lines: string[] = [];
     for (const task of ready) {
       const attempt = deriveSession(readEvents(runDir)).tasks[task.taskId]?.attempts ?? 0;
-      const model = engine.modelFor(task.taskId, attempt);
+      // The task tool cannot choose a model, so a dispatched worker runs on
+      // team/worker's configured model. Name that; fall back to the policy
+      // ladder only when the seat's model is unknown.
+      const configured = seatModel("team/worker");
+      const model = configured ?? engine.modelFor(task.taskId, attempt);
       const checks = engine.requiredChecksFor(task.taskId);
       engine.dispatch(task.taskId, { model: model ?? null });
       lines.push(
@@ -494,7 +512,7 @@ export const teamworkDispatch: ToolDefinition = tool({
           task.title ? `  title: ${task.title}` : "",
           `  spec: ${join(runDir, `spec-${task.taskId}.json`)}`,
           task.worktreePath ? `  worktree: ${task.worktreePath}` : "",
-          model ? `  model: ${model}` : "",
+          model ? `  model: ${model}${configured ? " (team/worker's configured model)" : " (policy ladder: advisory, the subagent runs on its agent's configured model)"}` : "",
           checks.length > 0 ? `  required checks for PASS: ${checks.join(", ")}` : "",
         ]
           .filter((l) => l !== "")
@@ -680,7 +698,11 @@ export const teamworkVerify: ToolDefinition = tool({
     return [
       head,
       recovered.trimEnd(),
-      outcome.nextModel ? `  next attempt escalates to: ${outcome.nextModel}` : "",
+      // No escalation is possible through the task tool, so only mention the
+      // ladder when the worker seat's model is unknown, and say what it is.
+      outcome.nextModel && !seatModel("team/worker")
+        ? `  policy ladder suggests ${outcome.nextModel} next (advisory: the worker runs on its configured model)`
+        : "",
       outcome.parkedDependents
         ? `  also dead-lettered, because they depend on it: ${outcome.parkedDependents.join(", ")}`
         : "",

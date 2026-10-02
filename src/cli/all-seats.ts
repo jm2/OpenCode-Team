@@ -72,16 +72,16 @@ const VENDOR_MODEL_SUBSTRINGS = [
  */
 export function findVendorModelStrings(
   value: unknown,
-  allow?: string,
+  allow?: string | readonly string[],
   path = "",
 ): Array<{ path: string; value: string }> {
   const hits: Array<{ path: string; value: string }> = [];
-  const allowed = allow?.toLowerCase();
+  const allowed = new Set((typeof allow === "string" ? [allow] : (allow ?? [])).map((a) => a.toLowerCase()));
 
   const walk = (node: unknown, at: string): void => {
     if (typeof node === "string") {
       const lower = node.toLowerCase();
-      if (allowed && lower === allowed) return;
+      if (allowed.has(lower)) return;
       const looksVendor =
         VENDOR_MODEL_PREFIXES.some((p) => lower.startsWith(p)) ||
         VENDOR_MODEL_SUBSTRINGS.some((s) => lower.includes(s));
@@ -116,6 +116,83 @@ export function allSeatsAgents(roles: readonly string[], modelId: string): Recor
   if (/\s/.test(id)) throw new Error(`model id must not contain whitespace: "${modelId}"`);
   const out: Record<string, string> = {};
   for (const role of roles) out[role] = id;
+  return out;
+}
+
+// ─── Two-model teams (--strong / --fast) ─────────────────────────────
+
+export type SeatTier = "strong" | "fast";
+
+/**
+ * Which seats get the cheaper model in a two-model team.
+ *
+ * Flash goes only where a weak answer is cheap or caught by code. The price
+ * gap that prompted this (MiMo V2.6 Pro vs DeepSeek V4.1 Flash) is about 1.5x
+ * on output and 2.9x on input, so a single extra round on a seat that writes
+ * or judges code costs more than the cheaper model saves. Override any seat
+ * with --seat <role>=<model>.
+ */
+export const SEAT_TIERS: Record<(typeof TEAM_ROLES)[number], { tier: SeatTier; why: string }> = {
+  "team/sentinel": { tier: "strong", why: "plans the DAG and drives every dispatch; a bad plan costs every later round" },
+  "team/orchestrator": { tier: "strong", why: "the v1 coordinator: same leverage as the sentinel" },
+  "team/crafter": { tier: "strong", why: "writes the spec; low volume, high leverage" },
+  "team/synthesizer": { tier: "strong", why: "one call decides the final candidate" },
+  "team/falsifier": { tier: "strong", why: "a weak critic waves bad candidates through" },
+  "team/proof-worker": { tier: "strong", why: "the hardest reasoning in the system" },
+  "team/worker": {
+    tier: "strong",
+    why: "writes the code; a failed round re-runs worker and verifier, which outweighs Flash's saving",
+  },
+  "team/verifier": { tier: "fast", why: "runs commands; the engine refuses a PASS without real exit codes" },
+  "team/scout": { tier: "fast", why: "reads files, so input-heavy, where Flash is cheapest" },
+  "team/proposer": { tier: "fast", why: "parallel candidates, filtered by a strong falsifier and synthesizer" },
+};
+
+/** Assign each seat its tier's model, then apply per-seat overrides. */
+export function tieredAgents(
+  roles: readonly string[],
+  strong: string,
+  fast: string,
+  overrides: Record<string, string> = {},
+): Record<string, string> {
+  const pick = (id: string, flag: string) => {
+    const v = id.trim();
+    if (!v || /\s/.test(v)) throw new Error(`${flag} needs a model id without whitespace, got "${id}"`);
+    return v;
+  };
+  const models = { strong: pick(strong, "--strong"), fast: pick(fast, "--fast") };
+  const out: Record<string, string> = {};
+  for (const role of roles) {
+    const tier = SEAT_TIERS[role as keyof typeof SEAT_TIERS]?.tier ?? "strong";
+    out[role] = models[tier];
+  }
+  return applySeatOverrides(out, overrides);
+}
+
+/** `--seat worker=deepseek/deepseek-flash`, repeatable. Role names may omit "team/". */
+export function parseSeatOverrides(args: readonly string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i]!;
+    const v = a === "--seat" ? args[i + 1] : a.startsWith("--seat=") ? a.slice("--seat=".length) : undefined;
+    if (v === undefined) continue;
+    const eq = v.indexOf("=");
+    if (eq <= 0 || eq === v.length - 1) throw new Error(`--seat expects <role>=<model>, got "${v}"`);
+    const role = v.slice(0, eq).startsWith("team/") ? v.slice(0, eq) : `team/${v.slice(0, eq)}`;
+    if (!(TEAM_ROLES as readonly string[]).includes(role)) {
+      throw new Error(`--seat: unknown role "${v.slice(0, eq)}". Roles: ${TEAM_ROLES.map((r) => r.slice(5)).join(", ")}`);
+    }
+    out[role] = v.slice(eq + 1).trim();
+  }
+  return out;
+}
+
+export function applySeatOverrides(agents: Record<string, string>, overrides: Record<string, string>): Record<string, string> {
+  const out = { ...agents };
+  for (const [role, model] of Object.entries(overrides)) {
+    if (/\s/.test(model) || !model) throw new Error(`--seat ${role}: invalid model id "${model}"`);
+    out[role] = model;
+  }
   return out;
 }
 

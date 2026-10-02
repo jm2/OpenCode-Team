@@ -215,6 +215,25 @@ export function summarize(records: UsageRecord[]): UsageSummary {
   return s;
 }
 
+/**
+ * Team seats that ran on a model other than the one configured for them.
+ * Works for a single-model team and a mixed one alike.
+ */
+export function seatMismatches(
+  summary: UsageSummary,
+  expected: Record<string, string>,
+): Array<{ agent: string; model: string; expected: string }> {
+  const out: Array<{ agent: string; model: string; expected: string }> = [];
+  for (const [agent, a] of Object.entries(summary.byAgent)) {
+    const want = expected[agent];
+    if (!want) continue;
+    for (const model of a.models) {
+      if (model.toLowerCase() !== want.toLowerCase()) out.push({ agent, model, expected: want });
+    }
+  }
+  return out;
+}
+
 /** opencode's own background agents: they run on `small_model`, not a seat. */
 export const INTERNAL_AGENTS = ["title", "summary", "compaction"];
 

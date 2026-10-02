@@ -24,6 +24,10 @@ import { fileURLToPath } from "node:url";
 import {
   ALL_SEATS_ENV,
   allSeatsAgents,
+  applySeatOverrides,
+  parseSeatOverrides,
+  SEAT_TIERS,
+  tieredAgents,
   billingFor,
   describeWithOpencode,
   findAlias,
@@ -467,6 +471,33 @@ function reportResolvedModel(info: { modelId: string; source: string; resolved?:
   console.log(`    source:    ${described ? "opencode models --verbose" : "provider block in your config"}`);
 }
 
+/** What opencode says about one model, as indented lines. */
+function describeModelLines(modelId: string): string[] {
+  const d = describeWithOpencode(modelId);
+  if (!d) return [`(opencode not on PATH, or it does not list ${modelId}; check: opencode models ${modelId.split("/")[0]} --verbose)`];
+  const lines = [`${d.name ?? modelId}, ${protocolFor(d.npm)} protocol (${d.npm ?? "?"})`];
+  if (d.url) lines.push(`endpoint ${d.url}${billingFor(d.url) === "unknown" ? "" : ` [${billingFor(d.url)}]`}`);
+  if (d.cost) lines.push(`$${d.cost.input ?? "?"} in / $${d.cost.output ?? "?"} out per 1M tokens`);
+  if (d.reasoning !== undefined) lines.push(`reasoning ${d.reasoning ? "on" : "off"}${d.interleavedField ? `, interleaved via ${d.interleavedField}` : ""}`);
+  return lines;
+}
+
+/** Show a two-model team: each model as opencode describes it, then each seat and why. */
+function reportTeam(agents: Record<string, string>, tiered: { strong: string; fast: string }): void {
+  console.log(`\n  Two-model team (--strong / --fast):`);
+  for (const [label, id] of [["strong", tiered.strong], ["fast", tiered.fast]] as const) {
+    console.log(`    ${label.padEnd(6)} ${id}`);
+    for (const l of describeModelLines(id)) console.log(`           ${l}`);
+  }
+  console.log(`\n    seat                 model`);
+  for (const [role, model] of Object.entries(agents)) {
+    const tier = SEAT_TIERS[role as keyof typeof SEAT_TIERS];
+    const planned = tier ? (tier.tier === "strong" ? tiered.strong : tiered.fast) : undefined;
+    const note = model !== planned ? "(--seat override)" : `— ${tier?.why ?? ""}`;
+    console.log(`    ${role.padEnd(20)} ${model.padEnd(28)} ${note}`);
+  }
+}
+
 /**
  * Assert the emitted patch is free of vendor model strings.
  *
@@ -474,16 +505,17 @@ function reportResolvedModel(info: { modelId: string; source: string; resolved?:
  * baseline, and it is invisible in a 10-role diff. This prints the verdict
  * rather than leaving the operator to eyeball it.
  */
-function reportSeatPurity(patch: Record<string, any>, modelId: string): void {
-  const leaks = findVendorModelStrings(patch, modelId);
+function reportSeatPurity(patch: Record<string, any>, models: readonly string[]): void {
+  const leaks = findVendorModelStrings(patch, models);
+  const seats = Object.keys((patch.agent ?? {}) as Record<string, unknown>).length;
   if (leaks.length === 0) {
-    const seats = Object.keys((patch.agent ?? {}) as Record<string, unknown>).length;
-    console.log(`\n  ✓ ${seats} seats, all "${modelId}". No vendor model strings in the patch.`);
+    const what = models.length === 1 ? `all "${models[0]}"` : `on ${models.map((m) => `"${m}"`).join(" and ")} only`;
+    console.log(`\n  ✓ ${seats} seats, ${what}. No other model strings in the patch.`);
     return;
   }
-  console.error(`\n  ✗ vendor model strings survived into the patch:`);
+  console.error(`\n  ✗ model strings you did not choose survived into the patch:`);
   for (const l of leaks) console.error(`      ${l.path} = ${l.value}`);
-  console.error(`  This would invalidate a single-model baseline. Refusing.`);
+  console.error(`  A default leaking into one seat would skew the run. Refusing.`);
   process.exit(1);
 }
 
@@ -531,13 +563,32 @@ async function cmdInstall(args: string[]): Promise<void> {
   // ── 1. Choose the model assignment ────────────────────────────────
   // `--all-seats <id>` and the alias presets short-circuit everything else:
   // one model in every seat the installer writes, no vendor fall-through.
-  const allSeats = resolveAllSeats(args, presetName, configPath);
+  // `--strong <id> --fast <id>` builds a two-model team from SEAT_TIERS.
+  // `--seat <role>=<model>` overrides single seats in any mode.
+  let seatOverrides: Record<string, string>;
+  try {
+    seatOverrides = parseSeatOverrides(args);
+  } catch (err) {
+    console.error(`✗ ${(err as Error).message}`);
+    process.exit(1);
+  }
+  const strong = flagValue(args, "--strong");
+  const fast = flagValue(args, "--fast");
+  if ((strong === undefined) !== (fast === undefined)) {
+    console.error(`✗ --strong and --fast go together: --strong <provider/model> --fast <provider/model>`);
+    process.exit(1);
+  }
+  const tiered = strong !== undefined && fast !== undefined ? { strong, fast } : null;
+  const allSeats = tiered ? null : resolveAllSeats(args, presetName, configPath);
 
   let agents: Record<string, string>;
   try {
-    if (allSeats) {
+    if (tiered) {
+      agents = tieredAgents(ROLES, tiered.strong, tiered.fast, seatOverrides);
+      reportTeam(agents, tiered);
+    } else if (allSeats) {
       reportResolvedModel(allSeats);
-      agents = allSeatsAgents(ROLES, allSeats.modelId);
+      agents = applySeatOverrides(allSeatsAgents(ROLES, allSeats.modelId), seatOverrides);
     } else if (presetName === "custom") {
       if (!isTTY || autoYes) {
         console.error(`✗ --preset custom asks for a model per role and needs an interactive terminal.`);
@@ -588,12 +639,18 @@ async function cmdInstall(args: string[]): Promise<void> {
     throw err;
   }
 
+  if (!tiered && !allSeats && Object.keys(seatOverrides).length > 0) {
+    agents = applySeatOverrides(agents, seatOverrides);
+  }
+  // The models every seat is meant to run on, when the user chose them.
+  const chosenModels = tiered || allSeats ? [...new Set(Object.values(agents))] : null;
+
   // ── 2. Build the patch and show what will change ──────────────────
   const patch = buildPatch(agents, pkg);
   if (printOnly) {
     console.log(`\n  # Would write to ${configPath}:\n`);
     console.log(JSON.stringify(patch, null, 2).split("\n").map((l) => "  " + l).join("\n"));
-    if (allSeats) reportSeatPurity(patch, allSeats.modelId);
+    if (chosenModels) reportSeatPurity(patch, chosenModels);
     return;
   }
 
@@ -661,14 +718,20 @@ async function cmdInstall(args: string[]): Promise<void> {
     console.log(`\n  Plugin: local build, ${pkg}`);
     console.log(`  Rebuild with \`bun run build\` after pulling changes; opencode loads that file.`);
   }
-  if (allSeats) {
-    reportSeatPurity(patch, allSeats.modelId);
-    console.log(`\n  One more step for a clean single-model baseline:`);
-    console.log(`    export ${ALL_SEATS_ENV}="${allSeats.modelId}"`);
-    console.log(`  Upstream's routing policy carries Anthropic and Google model ladders that`);
-    console.log(`  teamwork_dispatch recommends to the sentinel per task. That variable pins`);
-    console.log(`  every ladder rung to your model. See docs/GROUND-TRUTH.md section 8.`);
-    console.log(`\n  Then verify the provider actually answers as a subagent:`);
+  if (chosenModels) {
+    reportSeatPurity(patch, chosenModels);
+    if (chosenModels.length === 1) {
+      console.log(`\n  One more step for a clean single-model baseline:`);
+      console.log(`    export ${ALL_SEATS_ENV}="${chosenModels[0]}"`);
+      console.log(`  Upstream's routing policy carries Anthropic and Google model ladders that`);
+      console.log(`  teamwork_dispatch recommends to the sentinel per task. That variable pins`);
+      console.log(`  every ladder rung to your model. See docs/GROUND-TRUTH.md section 8.`);
+    } else {
+      console.log(`\n  At run time the plugin reads each seat's model from this config: dispatch`);
+      console.log(`  names the worker seat's model, and teamwork_status flags any seat that ran`);
+      console.log(`  on something else. costs.json splits spend by seat and by model.`);
+    }
+    console.log(`\n  Then verify ${chosenModels.length === 1 ? "the model answers" : "each model answers"} as a subagent:`);
     console.log(`    scripts/smoke-delegation.sh`);
   }
   console.log(`\n  Next: opencode (the plugin loads automatically).`);
