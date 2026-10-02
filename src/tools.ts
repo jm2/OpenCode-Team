@@ -132,7 +132,7 @@ function statusLine(engine: Engine): string {
     .join(", ");
   // Say where the figure came from. Metered is opencode's own record of this
   // run's sessions; reported is what the sentinel typed into teamwork_verify
-  // and is only used when nothing has been metered. See GROUND-TRUTH.md §11.
+  // and is only used when nothing has been metered. See docs/GROUND-TRUTH.md §3.
   const cap = engine.budgetEnforced
     ? `/$${s.budgetUsd.toFixed(2)} (${s.pctOfBudget.toFixed(0)}%)`
     : ` (no cap — budget enforcement disabled)`;
@@ -588,7 +588,7 @@ export const teamworkVerify: ToolDefinition = tool({
     // be schema-constrained (MiMo has JSON mode but no native json_schema) has
     // to hit this shape by prompting alone, so failures get a bounded repair
     // loop rather than an open-ended "try again" — and the raw output is kept
-    // either way. See docs/GROUND-TRUTH.md §6 and src/repair.ts.
+    // either way. See docs/GROUND-TRUTH.md §5 and src/repair.ts.
     const runDir = runDirFor(context.directory, args.sessionId);
     let rawText: string;
     if (args.reportPath) {

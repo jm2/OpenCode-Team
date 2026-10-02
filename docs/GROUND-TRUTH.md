@@ -1,478 +1,489 @@
-# Ground truth: what `opencode-teamwork` actually implements
+# Ground truth: what this fork of `opencode-teamwork` implements
 
-> **Status (review pass, in progress).** Parts of this document predate a
-> later review and are superseded; the full rewrite has not been done yet.
-> Until it is, the commit log on this branch is authoritative. Known changes:
->
-> - **The plugin never loaded on current opencode.** opencode 1.18.32 rejects
->   the entry module ("Plugin export is not a function"), for both npm 0.2.1
->   and this repo; fixed on `fix/plugin-entry-exports`. npm's only release,
->   0.2.1, also lacks the whole engine this document describes.
-> - **§7.2 protocol, no longer unverified:** opencode's bundled catalog maps
->   the `xiaomi` provider to `@ai-sdk/openai-compatible` at
->   `api.xiaomimimo.com` (OpenAI protocol, pay-as-you-go). Token Plans are
->   separate `xiaomi-token-plan-*` providers. `opencode models xiaomi
->   --verbose` confirms it for your install.
-> - **§3 / §11:** `--budget` and `--no-budget` did not reach the engine in
->   code; `teamwork_plan` now applies them itself. The budget is enforced
->   against cost metered from opencode's own records (`usage.jsonl`,
->   `costs.json`), not the sentinel's self-report.
-> - **§8b:** the policy-fallback claim about privilege-escalation checks was
->   overstated. There are now 17 `fix/*` branches, not 8.
-> - **Phase 2 repair loop:** exhaustion now fails the task instead of wedging
->   the run; raw evidence is no longer overwritten across rounds.
-> - **Phase 3 smoke test:** rewritten on recorded evidence; verified against
->   real opencode with a scripted fake provider. It checks every distinct
->   seat model as primary, with tools, and as a subagent.
-> - **Two-model teams** are supported; see §12.
+This document describes the code on branch `claude/wonderful-einstein-atn3hj`,
+forked from upstream v0.3.0 (`281821a`). Every claim below was read from
+`src/` and then executed. Where the README and the code disagree, the code
+wins and the disagreement is named. References are `file` plus a symbol,
+not line numbers, so they survive edits.
 
-Audit of the code at `281821a` (v0.3.0), written for a single-model baseline
-experiment. Everything below was read out of `src/`, and the behavioural claims
-were executed, not inferred. Where the README and the code disagree, the code
-wins and the disagreement is named.
+**Evidence standard.** Behaviour was checked three ways:
 
-**Scope note.** Sections 1–6 are facts about this repository. Section 7 is about
-the provider, and is answered only as far as the information supplied allows —
-the parts that require the operator's `opencode.json` are marked UNVERIFIED
-rather than guessed.
+1. by driving the engine directly, against a scratch git repo with a real bug;
+2. by running real **opencode 1.18.32** with this build loaded and
+   `scripts/fake-model-server.ts` as the provider: a scriptable
+   OpenAI-compatible server that can call tools, delegate, and fail with
+   any HTTP status;
+3. by the test suite (`bun run verify`: typecheck, 224 tests, build, smoke,
+   e2e, integration).
+
+**Nothing has yet run against the real Xiaomi or DeepSeek endpoints.** No
+credentials were available. Section 9 is the check to run first when they
+are.
 
 ---
 
-## 1. Agent roster — 10 exist, all 10 are real
+## 0. The questions the brief asked
 
-The README blurb and the feature table agree on 10; the *documented example
-config* showing six is the thing that is wrong. All ten agents exist as
-markdown templates, are loaded by `src/templates.ts:120` (`AGENT_FILES`), and
-are injected into `config.agent` by the plugin's `config` hook
-(`src/index.ts:147`).
+| Question | Answer | Section |
+|---|---|---|
+| Model id | `xiaomi/mimo-v2.6-pro`, lower case. `MiMo-V2.6-Pro` is the display name. | 6.1 |
+| Which protocol the provider speaks | **OpenAI.** opencode maps `xiaomi` to `@ai-sdk/openai-compatible` at `api.xiaomimimo.com`. | 6.2 |
+| Is thinking mode uniform across seats? | **Yes, by construction.** Reasoning is a property of the model, and the plugin writes no per-agent reasoning key. **Not changed.** Temperatures do differ per role. | 6.3 |
+| Is cost tracking measuring anything real? | Upstream: no, it summed numbers the model typed. Now the budget is enforced against cost metered from opencode's own records. | 3 |
+| Did upstream work on current opencode at all? | **No.** opencode 1.18.32 refused to load the plugin. npm's only release, 0.2.1, also lacks the engine. | 11 |
+
+## 1. Agent roster: 10 agents, all real
+
+All ten exist as markdown templates under `src/cli/templates/`. They are
+loaded through `AGENT_FILES` (`src/templates.ts`) and injected into
+`config.agent` by the plugin's `config` hook (`src/index.ts`). The README
+blurb and feature table say 10, correctly. Its example config, showing six,
+is stale.
 
 | Agent | Mode | Loop | Drives the engine? |
 |---|---|---|---|
-| `team/sentinel` | primary | **v2** (DAG `/teamwork`) | yes |
-| `team/orchestrator` | primary | **v1** (legacy `/team-orchestrate`) | yes |
-| `team/crafter` | primary | shared (Phase-1 spec elicitation) | no |
+| `team/sentinel` | primary | v2 (DAG, `/teamwork`) | yes |
+| `team/orchestrator` | primary | v1 (`/team-orchestrate`) | yes |
+| `team/crafter` | primary | shared (spec elicitation) | no |
 | `team/worker` | subagent | v2 | no |
 | `team/proof-worker` | subagent | v2 | no |
 | `team/verifier` | subagent | v2 | no |
-| `team/proposer` | subagent | **v1** | no |
-| `team/falsifier` | subagent | **v1** | no |
-| `team/synthesizer` | subagent | **v1** | no |
-| `team/scout` | subagent | shared (read-only context gathering) | no |
+| `team/proposer` | subagent | v1 | no |
+| `team/falsifier` | subagent | v1 | no |
+| `team/synthesizer` | subagent | v1 | no |
+| `team/scout` | subagent | shared (read-only context) | no |
 
-`ENGINE_ROLES` (`src/guard.ts:43`) is exactly `["team/sentinel",
-"team/orchestrator"]`. Every other role calling `teamwork_*` gets a refusal
-string, not a task (`src/tools.ts:65`).
+`ENGINE_ROLES` (`src/guard.ts`) is exactly sentinel and orchestrator. Any
+other role calling a `teamwork_*` tool gets a refusal string. The DAG engine
+knows about tasks, not roles. Proposer, falsifier and synthesizer have no
+code path into it: only the v1 orchestrator prompt dispatches them. The
+eight leaf roles declare `permission.task: deny`, and the runtime guard now
+enforces that too (`fix/guard-task-permission`), so a worker cannot fan out
+its own swarm.
 
-The v1/v2 split is real but softer than the docs imply: proposer, falsifier and
-synthesizer have no code path into the DAG engine at all. They are dispatched by
-the v1 orchestrator prompt only. The DAG engine (`teamwork_plan` →
-`teamwork_dispatch` → `teamwork_verify`) knows about tasks, not roles, and its
-dispatch text hard-codes the advice "spawn a `team/worker` … then
-`team/verifier`" (`src/tools.ts:330`).
+## 2. What the installer writes
 
-## 2. What the installer writes — all 10 roles, not 6
+`opencode-teamwork install` (`src/cli/index.ts`, `cmdInstall`) writes
+`agent["team/<role>"] = { model }` for all ten roles. It supports four modes:
 
-`ROLES` in `src/cli/index.ts:157` lists all ten. Every preset in `PRESETS`
-supplies all ten. `buildPatch` (`src/cli/index.ts:328`) turns that map into
-`agent["team/<role>"] = { model }`. So the emitted patch covers all ten roles,
-and the six-entry example in the docs is simply stale.
-
-**The fall-through does exist, just not where the docs suggest.** Two hard-coded
-Anthropic defaults sit behind the installer:
-
-1. `src/templates.ts:113` — `model: fm.model ?? "anthropic/claude-sonnet-4-5"`.
-2. All ten agent markdown files carry `model: anthropic/claude-sonnet-4-5` in
-   frontmatter.
-
-`agentConfigFor` (`src/templates.ts:222`) prefers the user's existing
-`opencode.json` value and falls back to the template's. So a role the installer
-wrote is safe; a role the user deleted, renamed, or never had silently becomes
-Claude Sonnet. For a single-model baseline that is a live hazard, which is why
-`--all-seats` writes all ten explicitly and the test asserts the emitted patch
-is vendor-free.
-
-**Dead code:** the `custom` per-role picker is unreachable. `pickPreset`
-(`src/cli/index.ts:277`) returns `"custom"` only when `idx === PRESETS.length`,
-but `pickMenu` can only return `0..PRESETS.length-1` or `null`. `--preset custom`
-hits the "Unknown preset" branch. The `custom` option documented in `SKILL.md`
-does not work.
-
-## 3. Budget — warn at 80%, refuse dispatch at 100%. Executed, and it is worse than that.
-
-The feature table's "halt at 80%" is wrong; the README prose at line 134 ("warns
-at 80%, and refuses further dispatch at 100%") is right. Confirmed by running the
-engine:
-
-```
-cap $1.00, haltAtPct 80
-  after $0.85 (85%)  → budget.warning logged, budgetExhausted() = false,
-                        dispatchable() = ["t1","t2"]   ← still dispatches
-  after $1.15 (115%) → budgetExhausted() = true, dispatchable() = []
-```
-
-`haltAtPct` only emits a `budget.warning` event (`src/engine.ts:701`). Nothing
-reads it. The only real gate is `dispatchable()` (`src/engine.ts:540`), which
-returns `[]` and logs `budget.exhausted` once `costUsd >= budgetUsd`.
-
-**Enforced before dispatch, yes — but on a number the model makes up.**
-
-This is the finding that matters most for the experiment. The cap is checked
-before handing out work, but the quantity being checked is supplied by the
-orchestrating model:
-
-- `teamwork_verify` takes `costUsd` as an **optional** tool argument
-  (`src/tools.ts:377`).
-- `recordRound` defaults it to `0` when absent (`src/engine.ts:640`).
-- `deriveSession` sums those self-reports and nothing else
-  (`src/events.ts:260`).
-
-There is no token metering, no provider usage read, and no price-table lookup
-anywhere in the live path. Executed:
-
-```
-cap $0.01, 20 verifier rounds recorded without costUsd
-  costUsd = 0 | pctOfBudget = 0% | budgetExhausted = false
-  dispatchable = ["t1"] | budget.* events = 0
-```
-
-A sentinel that never passes `costUsd` runs forever against any cap.
-
-`--budget` **is** parsed in code, not by a model: `parseCommandFlags`
-(`src/index.ts:45`) handles `--budget`, `--topology`, `--concurrency`,
-`--session`, validates them, and writes the result to `request.md` plus
-`LATEST.json` before the model sees anything. That part of the README is true.
-
-**`src/cost.ts` is orphaned.** Nothing in `src/`, `scripts/` or `test/` imports
-it. `createCostTracker`, the `DEFAULT_RATES` price table, `shouldHalt()` at 80% —
-none of it runs. `costs.json` is **never written**; a run directory contains
-`events.jsonl`, `state.json`, `plan.dag.json` and the per-task specs. The only
-mentions of `costs.json` are in the agent prompt templates
-(`prompts/sentinel.txt:36`, `prompts/worker.txt:17`), which tell the model about
-a file the code never creates.
-
-If it were wired in, it would misprice this experiment badly: `estimateCost`
-(`src/cost.ts:82`) falls back to `rates["anthropic/claude-sonnet-4-5"]` for any
-model not in its table. Executed, for 1M input + 1M output tokens:
-
-| Priced as | Cost |
+| Mode | Seats |
 |---|---|
-| `xiaomi/mimo-v2.6-pro` through the fallback | $18.00 |
-| MiMo's real rate (0.435 / 0.87 per 1M) | $1.30 |
+| `--preset <name>` | one of the five upstream presets: `anthropic`, `team`, `google`, `openai`, `free` |
+| `--preset custom` | a per-role picker. Upstream it was unreachable (`fix/cli-preset-menu`). |
+| `--all-seats <id>` or `--preset mimo` | every seat on one model. `mimo` resolves the id from your own opencode.json and never hardcodes one. |
+| `--strong <id> --fast <id>` | a two-model team (section 7) |
 
-A 13.8× overstatement, silently. Note also the unit mismatch: `DEFAULT_RATES` is
-USD per **1k** tokens, while the model card quotes per **1M**.
+`--seat <role>=<model>` overrides single seats in any mode. `--plugin
+local|<path>|file://…|<npm spec>` chooses which build opencode loads. With
+`--plugin local`, it loads this checkout's `dist/index.js`, which you need
+for anything in this fork. **No npm release has the fork's metering, repair
+loop or `--no-budget`.**
 
-## 4. Presets — five, defined in one array, shape is flat
+**Purity check.** For `--all-seats` and `--strong/--fast`, the installer
+scans the whole patch for model strings and refuses to write it if any
+model you did not choose remains (`findVendorModelStrings`). Before writing,
+it prints each model's protocol, endpoint and reasoning setting, as opencode
+resolves them (`opencode models <provider> --verbose`). For a two-model team
+it also prints each model's price.
 
-`PRESETS` at `src/cli/index.ts:74`. Shape:
+Fixed along the way, with each fix on its own upstream branch (section 11):
 
-```ts
-interface Preset {
-  name: string;
-  description: string;
-  agents: Record<string, string>;  // "team/<role>" -> model id
-}
+- **Hard-coded fallback model.** Upstream, every template's frontmatter and
+  `loadAgent` defaulted to `anthropic/claude-sonnet-4-5`. Any seat you had
+  not named was silently Claude. Without Anthropic credentials, `/teamwork`
+  could not run at all (`ProviderModelNotFoundError`). Now an unnamed seat
+  uses your configured default model (`fix/no-default-model-injection`).
+- **Install and uninstall destroyed unrelated config.** Uninstall kept only
+  `plugin` and `agent`, dropping your providers and MCP servers
+  (`fix/installer-preserves-user-config`).
+- **JSONC stripping mangled strings.** Strings containing `//` or `/*`
+  could be altered, e.g. a `src/**/*.ts` permission rule became
+  `src*.ts` (`fix/installer-jsonc-strings`).
+- **Unpinned plugin version.** The installer wrote `opencode-teamwork@latest`,
+  which resolves to npm's 0.2.1 (`fix/installer-pin-plugin-version`).
+
+## 3. Budget and cost
+
+### What upstream did
+
+- **No 80% halt.** The feature table says "halt at 80%". `haltAtPct` only
+  logs a `budget.warning`, and nothing reads that event. The only gate is
+  `dispatchable()`, which returns nothing once cost reaches 100% of the
+  budget. The README prose ("warns at 80%, refuses further dispatch at
+  100%") is right.
+- **The cost was the model's own claim.** It was the `costUsd` argument the
+  sentinel passed to `teamwork_verify`. That argument was optional and
+  defaulted to 0. Executed: 25 rounds against a $0.01 cap, cost stayed
+  $0.00, and dispatch never stopped.
+- **Nothing priced tokens.** `src/cost.ts` (a price table and tracker) was
+  imported nowhere, and `costs.json` was never written. The agent prompts
+  described both anyway. Had `estimateCost` been wired in, it would have
+  priced MiMo off Claude Sonnet's card: $18.00 instead of $1.30 per 1M in +
+  1M out, a 13.8× overstatement.
+- **Flags from the CLI path were dropped.** `--budget` was parsed in code
+  but never reached the engine (`fix/plan-honours-parsed-flags`). From the
+  opencode CLI, the quoting wrapped around arguments made `--budget` parse
+  as NaN (`fix/command-args-cli-quoting`).
+- **Topology budgets were unreachable.** Per-topology default budgets could
+  not apply, because `DEFAULT_POLICY.budget.perSessionUsd` (20) always won
+  (`fix/topology-budget-defaults`).
+
+### What this fork does
+
+- **Metered cost.** The plugin's `event` hook (`src/telemetry.ts`,
+  `UsageObserver`) records every finished assistant message: tokens
+  (including reasoning and cache), opencode's cost (catalog price ×
+  provider-reported tokens), model, agent, parent session, and any provider
+  error with its HTTP status and body. Records go to the run's
+  `usage.jsonl`, with a `costs.json` summary by model and by seat.
+  Subagent sessions are traced to the run through their `parentID`.
+- **Which figure the budget uses.** `Engine.effectiveCost` returns the
+  metered figure whenever anything has been metered. It uses the sentinel's
+  self-report only when nothing has. Every status line names the source:
+  `[metered by opencode]` or `[self-reported by the sentinel: nothing
+  metered for this run]`.
+- **When the budget acts.** The warning still fires at `haltAtPct` (80%).
+  Dispatch stops at 100% of metered cost, even when the sentinel reports
+  nothing (`test/telemetry.test.ts`).
+- **`--no-budget`.** It disables enforcement. It is parsed in code, recorded
+  in `session.start`, and survives resume. Enforcement stays the default.
+- **`src/cost.ts`** is still not used at run time: opencode's own cost
+  replaces it. It no longer prices an unknown model as Claude Sonnet; it
+  reports the model as unpriced instead (`fix/cost-artifacts-never-written`).
+
+**What metering is, and is not.** It is opencode's computation from the
+provider's token counts and the catalog price. It is not your provider's
+invoice. On a Token Plan subscription, a dollar figure is notional either
+way.
+
+## 4. Presets and topologies
+
+**Presets.** A preset is a flat map from role to model string (`PRESETS`
+in `src/cli/index.ts`). Presets carry no per-role reasoning or temperature.
+
+**Topologies.** There are six, not four. `TOPOLOGIES` (`src/policy.ts`) is
+the single source: `small-focused`, `iterative-coding`, `distributed-coding`,
+`long-proof`, `massive-proof-swarm`, `document-review`. Each one sets:
+
+- the concurrency cap;
+- the maximum rounds;
+- the default budget, applied now;
+- which pattern file the sentinel is told to read.
+
+A topology does not change which agents run; that is decided in the prompts.
+`assertTopologiesResolve()` fails closed if a name loses its pattern file.
+
+## 5. Parse boundaries on model output, and the repair loop (Phase 2)
+
+All Zod parsing goes through `parseArtifact` (`src/artifacts.ts`).
+`teamwork_plan` builds two of the boundaries (`PlanDagSchema`,
+`SpecSchema`) from tool arguments that have already been type-checked, so
+they almost cannot fail. **Exactly one boundary takes free-form model JSON**:
+
+- the verifier writes `verification_report.json`;
+- `teamwork_verify` parses it and checks it against
+  `VerificationReportSchema`.
+
+That boundary goes through `repairArtifact` (`src/repair.ts`):
+
+- **Raw output is kept.** Every submission is written to
+  `<run>/repair/<task>.NNN.raw.json` before it is judged. Files are numbered
+  across the whole run and never overwritten.
+- **The model gets the real error.** A failure returns the Zod error, a
+  sketch of the expected shape, and an instruction addressed to the
+  sentinel. Each failure is logged as an `artifact.rejected` event.
+- **The bound is two re-prompts** (`DEFAULT_MAX_REPAIRS`). The third failure
+  is terminal: `Engine.failTask` marks the task FAILED, parks its
+  dependents, and lets the run finish. The model is told not to hand-write a
+  substitute.
+- **Nothing is invented.** The loop never coerces, default-fills or
+  fabricates. A PASS with no executed check is never "repaired" into a valid
+  one.
+
+**No native structured output is requested anywhere.** No `json_schema` or
+`response_format` appears in the tree, and a test checks this. MiMo's lack of
+`json_schema` support therefore costs nothing at the provider level.
+
+Two non-Zod parses were also hardened. A truncated `events.jsonl` or
+`plan.dag.json` is reported instead of thrown (`fix/event-log-partial-write`).
+A malformed `.teamwork/policy.json` now fails loudly instead of silently
+reverting to defaults (`fix/policy-parse-silent-fallback`).
+
+## 6. Provider facts
+
+### 6.1 Model identity
+
+From the operator's model card:
+
+```
+id:   xiaomi/mimo-v2.6-pro        name: MiMo-V2.6-Pro
+tool_call, reasoning, temperature, attachment: true
+interleaved reasoning via reasoning_content
+context 1,048,576 / output 131,072
+cost per 1M: 0.435 in / 0.87 out / 0.0036 cache read
 ```
 
-`anthropic`, `team`, `google`, `openai`, `free` — each supplying all ten roles.
-There is no nesting, no per-role parameters, no reasoning or temperature field.
-A preset is nothing but a role→model-string map, which is why `--all-seats` is a
-three-line construction over the same shape.
+opencode matches model ids literally, so the lower-case id is the one that
+works. The catalog bundled in opencode 1.18.32 lists MiMo only up to v2.5
+(`test/fixtures/opencode-1.18.32-models-xiaomi-verbose.txt`). v2.6 comes from
+the live models.dev catalog opencode fetches, or from a model entry in your
+opencode.json.
 
-## 5. Topologies — six, all wired, all backed by a file
+### 6.2 Protocol: OpenAI
 
-Six, not four. `TOPOLOGIES` (`src/policy.ts:31`) is the single source of truth:
-`small-focused`, `iterative-coding`, `distributed-coding`, `long-proof`,
-`massive-proof-swarm`, `document-review`. Each carries `defaultConcurrency`,
-`defaultMaxRounds`, `defaultMaxCostUsd`.
+The bundled catalog maps provider `xiaomi` to `@ai-sdk/openai-compatible` at
+`https://api.xiaomimimo.com/v1`. That is the OpenAI chat-completions protocol
+on the pay-as-you-go endpoint. Token Plans are separate providers
+(`xiaomi-token-plan-cn`, `-ams`, `-sgp`) on `token-plan-*.xiaomimimo.com`
+hosts.
 
-All six are wired to the DAG engine: `teamwork_plan`'s `topology` argument is an
-enum over `TOPOLOGY_NAMES` (`src/tools.ts:128`), `validatePlan` rejects anything
-else (`src/engine.ts:150`), and `assertTopologiesResolve()` fails closed if a
-name stops mapping to a pattern file. All six `.md` files exist under
-`src/cli/templates/patterns/`.
+Your install decides which applies. The installer and
+`scripts/smoke-delegation.sh` both read the protocol, endpoint and billing
+mode from `opencode models xiaomi --verbose`, and print them. A subagent
+round trip that passes on one protocol is not evidence for the other.
 
-What a topology actually changes is modest: concurrency cap, max rounds, default
-budget, and which markdown the orchestrating agent is told to read. It does not
-change which agents get spawned — that is prompt-level.
+### 6.3 Thinking mode: on, and uniform by construction. Not changed.
 
-## 6. Zod parse boundaries on model output (Phase 2 inventory)
+`reasoning: true` is declared on the model. The plugin's injected agent
+config (`InjectedAgentConfig`, `src/templates.ts`) carries only:
 
-Four Zod schemas exist in `src/artifacts.ts`: `SpecSchema`,
-`VerificationReportSchema`, `DagTaskSchema`, `PlanDagSchema`. All parsing goes
-through `parseArtifact` (`src/artifacts.ts:134`), which is `safeParse` plus a
-readable error. Where they sit relative to model output:
+- description
+- mode
+- model
+- temperature
+- color
+- permission
+- prompt
+- hidden
+- tools
 
-| # | Site | Input | Really model-shaped? | Failure behaviour (before this change) |
-|---|---|---|---|---|
-| 1 | `src/tools.ts:413` `teamwork_verify` → `VerificationReportSchema` | **`JSON.parse` of a file the verifier model wrote**, or tool args | **Yes — the only raw free-form model JSON in the codebase** | returns an error string to the model; round not counted; unbounded manual retries |
-| 2 | `src/tools.ts:396` `teamwork_verify` → `JSON.parse(reportPath)` | same file | **Yes** | returns an error string; raw output discarded |
-| 3 | `src/tools.ts:188` `teamwork_plan` → `PlanDagSchema` | object built by code from validated tool args | No | returns error string; run not created |
-| 4 | `src/tools.ts:229` `teamwork_plan` → `SpecSchema` | object built by code from validated tool args | No | `engine.abort()` — kills the run |
+There is no reasoning, thinking or effort key, so thinking cannot differ
+between seats through this plugin. The usage observer counts reasoning
+tokens per seat, so a seat that did not think shows up in `teamwork_status`.
+The smoke test compares a primary call with a subagent call.
 
-Boundaries 3 and 4 are code-constructed from arguments the tool layer has already
-type-checked, so they are near-unfailable in practice. **Boundary 1/2 is the
-real exposure**: `verification_report.json` is free-form JSON written by the
-verifier model to disk, read back with a bare `JSON.parse`, then Zod-validated.
-
-Three non-Zod parses are also worth knowing about:
-
-- `src/engine.ts:436` — `JSON.parse(plan.dag.json)` in `Engine.resume()` is
-  **uncaught**. A truncated plan file throws and the run cannot be resumed.
-- `src/tools.ts:48` — `loadPolicy` swallows any parse error and silently
-  returns `DEFAULT_POLICY`. A typo in `.teamwork/policy.json` reverts you to the
-  vendor ladders in section 8 with no warning.
-- `src/cost.ts:65` — orphaned, see section 3.
-
-**Failure behaviour now** (boundary 1/2 only): `teamwork_verify` routes the raw
-text through `repairArtifact` (`src/repair.ts`). Every submission is written to
-`<runDir>/repair/<taskId>.attempt-N.raw.json` before it is judged. A failure
-returns the Zod error plus a generated shape sketch and a repair instruction,
-counted against a per-task ledger. After two repairs the third failure is
-terminal: the run is told to stop resubmitting, to not hand-write a substitute,
-and to report the preserved paths to the user. The round is never counted and
-no object is fabricated. A genuinely valid report submitted later is still
-accepted, and says how many repairs it took.
-
-**No native structured outputs are requested anywhere.** Grepping the whole tree
-for `json_schema`, `response_format`, `responseFormat`, `structuredOutput`,
-`zodResponseFormat` and `toJSONSchema` returns nothing. The plugin never asks a
-provider to constrain generation; it relies entirely on opencode's tool-argument
-layer plus these Zod checks. Phase 2's "make native structured output
-conditional on provider capability" therefore has **no code to make
-conditional** — MiMo's lack of `json_schema` support costs this plugin nothing
-at the provider level. The exposure is entirely at boundary 1/2, which is what
-the bounded-repair change addresses.
-
-## 7. Provider facts
-
-### 7.1 Model identity
-
-From the model definition supplied by the operator:
-
-```
-id:      xiaomi/mimo-v2.6-pro
-name:    MiMo-V2.6-Pro
-```
-
-**The id is lower-case.** The brief quoted `xiaomi/MiMo-V2.6-Pro`; that is the
-display name, not the identifier. `xiaomi/mimo-v2.6-pro` is what every seat is
-assigned. Model ids are matched literally by opencode, so the distinction is
-load-bearing.
-
-Declared capabilities: `tool_call true`, `reasoning true`, `temperature true`,
-`attachment true`, interleaved reasoning, `reasoning_content` as the reasoning
-field. Context 1,048,576 in / 131,072 out. Cost 0.435 in / 0.87 out / 0.0036
-cache, per 1M tokens.
-
-### 7.2 Which protocol the provider speaks — UNVERIFIED
-
-**This could not be determined and has not been guessed.** The model definition
-above describes the *model*; the protocol is set on the *provider* entry that
-contains it — its `npm` package and `options.baseURL`. Neither was available.
-
-This machine has no opencode installation at all: no `opencode.json` at any
-standard path, no `auth.json`, no `opencode` binary, no Xiaomi environment
-variables. The repository was cloned into an otherwise empty container.
-
-To resolve it, read the provider block in `opencode.json`:
-
-| `npm` value | Protocol | What the smoke test must exercise |
-|---|---|---|
-| `@ai-sdk/openai-compatible` (or `@ai-sdk/openai`) | OpenAI | `/chat/completions`, `tools[]`, `tool_calls` |
-| `@ai-sdk/anthropic` | Anthropic | `/v1/messages`, `tools[]`, `tool_use` blocks |
-
-`scripts/smoke-delegation.sh` reads this out of the config at run time and
-reports which protocol it exercised, so the answer is recorded by the run rather
-than assumed here. The brief's point stands: a subagent round-trip that passes on
-one protocol is not evidence for the other, and the script refuses to claim
-otherwise.
-
-### 7.3 Thinking mode — ON, and uniform by construction
-
-`reasoning true` is declared on the **model**, not per agent. Because every seat
-is assigned the same model id, every seat inherits the same reasoning setting.
-Nothing in this plugin writes a per-agent reasoning, thinking or
-reasoning-effort key: `InjectedAgentConfig` (`src/templates.ts:192`) carries
-only `description`, `mode`, `model`, `temperature`, `color`, `permission`,
-`prompt`, `hidden`, `tools`. So thinking cannot drift between seats through this
-plugin. **No change has been made to it.**
-
-**But the seats are still not identical**, and for a single-model baseline this
-is a confound worth knowing about before the run starts. The plugin injects a
-*different temperature per role*, straight from the template frontmatter, and
-MiMo declares `temperature true`, so it will honour them:
+**But the seats are not identically configured.** Temperatures come from
+template frontmatter, and MiMo honours them:
 
 | Temperature | Roles |
 |---|---|
-| 0.0 | `scout`, `verifier` |
-| 0.1 | `falsifier` |
-| 0.2 | `crafter`, `sentinel`, `orchestrator` |
-| 0.3 | `worker`, `proof-worker`, `synthesizer` |
-| 0.4 | `proposer` |
+| 0.0 | scout, verifier |
+| 0.1 | falsifier |
+| 0.2 | crafter, sentinel, orchestrator |
+| 0.3 | worker, proof-worker, synthesizer |
+| 0.4 | proposer |
 
-If the experiment is meant to isolate the propose → falsify → synthesize →
-verify *loop*, note that proposer and verifier differ by 0.4 in sampling
-temperature on top of differing prompts. That is a deliberate upstream design
-choice, not a bug, and it has been left alone — but "same model in every seat"
-does not yet mean "same configuration in every seat". Pinning temperature is a
-one-line change per template if the baseline needs it; say the word.
+This is upstream's design and has been left alone. Pinning temperatures is a
+one-line change per template, if the baseline needs it.
 
-## 8. Vendor model strings that survive `--all-seats`
+### 6.4 Billing
 
-`--all-seats` covers every seat the installer writes. Three vendor strings live
-elsewhere in the codebase and are worth knowing about:
+The endpoint host decides billing: `api.xiaomimimo.com` is pay-as-you-go,
+`token-plan-*` is a subscription. Both the installer and the smoke test print
+which one you are on (`billingFor` in `src/cli/all-seats.ts`).
 
-1. **`DEFAULT_POLICY.routing` ladders** (`src/policy.ts:115`) — five task classes
-   with Anthropic and Google ladders. `engine.modelFor()` resolves these and
-   `teamwork_dispatch` prints `model: anthropic/claude-sonnet-4-5` to the
-   sentinel as the model to use for that task (`src/tools.ts:318`). This is
-   *advisory text*, not a routing decision — the subagent's real model comes from
-   `config.agent["team/worker"].model` — but it is a vendor string being
-   recommended into a seat, and it is recorded in the `task.dispatched` event.
-   **Neutralised** by `--all-seats` writing `.teamwork/policy.json` with every
-   ladder pinned to the one model (see section 9). Without that file, the
-   ladders are live.
-2. **Template frontmatter** (all ten `.md` files) — only reachable for a role
-   missing from `opencode.json`, which `--all-seats` prevents.
-3. **`cost.ts` price table** — orphaned, see section 3.
+## 7. Two-model teams: MiMo Pro plus DeepSeek V4.1 Flash
 
-## 10. Phase 4 — what was verified, and what could not be
+`install --strong <id> --fast <id>` assigns each seat a tier from
+`SEAT_TIERS` (`src/cli/all-seats.ts`), and prints the reason for each.
 
-**The orchestration loop was not run.** `/teamwork` needs opencode and a live
-provider; this machine has neither (§7.2). Everything below was checked by
-driving the engine directly against a scratch git repository containing a real
-off-by-one bug and a genuinely failing test. That covers every claim in the
-Phase 4 list except the ones that require a model, and it is the harness those
-claims are actually about.
+| | MiMo V2.6 Pro | DeepSeek V4.1 Flash | Pro ÷ Flash |
+|---|---|---|---|
+| id | `xiaomi/mimo-v2.6-pro` | `deepseek/deepseek-flash` | |
+| input, per 1M | $0.435 | $0.15 | 2.9× |
+| output, per 1M | $0.87 | $0.60 | 1.45× |
+| cache read, per 1M | $0.0036 | $0.003 | 1.2× |
 
-**16 of 18 checks passed. Both failures are §3.**
+**The Flash id.** opencode 1.18.32's bundled catalog calls
+`deepseek/deepseek-flash` "DeepSeek V4.1 Flash": OpenAI protocol at
+`api.deepseek.com`, reasoning with interleaved `reasoning_content`, 1M
+context. **`deepseek/deepseek-v4-flash` is a different entry, the older V4
+Flash.** Confirm the id with `opencode models deepseek --verbose`.
 
-| Claim | Result |
+**Where Flash goes.** The price gap is small, so a seat that writes or
+judges code costs more in one extra round than Flash saves. Only three seats
+get Flash:
+
+- **verifier**: the engine refuses a PASS without real exit codes, so a
+  weaker verifier is still caught by code;
+- **scout**: it mostly reads files, so its cost is mostly input, where Flash
+  is cheapest;
+- **proposer**: its candidates are filtered by a strong falsifier and
+  synthesizer.
+
+The other seven stay on Pro: sentinel, orchestrator, crafter, worker,
+proof-worker, falsifier and synthesizer.
+
+**Is a Flash worker worth it?** That is measurable rather than a guess.
+Install again with `--seat worker=deepseek/deepseek-flash`, run the same
+tasks, and compare `costs.json` and the rounds per task.
+
+**Checks at run time.** The plugin records each seat's configured model from
+the config hook (`src/seat-models.ts`). `teamwork_dispatch` names the worker
+seat's model. `teamwork_status` flags any seat that ran on a model other than
+its configured one (`seatMismatches`), and splits spend by model.
+
+**What it cannot do.** opencode's task tool takes no model argument, so a
+subagent always runs on its agent's configured model. Escalating per call,
+such as retrying one failed task on Pro, is impossible through it.
+
+## 8. Model strings outside the seats
+
+- **Routing ladders.** `DEFAULT_POLICY.routing` (`src/policy.ts`) holds
+  Anthropic and Google ladders. They were only ever advisory: the dispatch
+  text recommended a model the subagent could not be switched to. Dispatch
+  now names the worker seat's configured model, and shows the ladder only if
+  that model is unknown. For a strict single-model baseline,
+  `TEAMWORK_ALL_SEATS_MODEL=<id>` pins every rung as well, so the
+  `task.dispatched` events record only your model. The installer prints the
+  `export` line.
+- **Template frontmatter.** It no longer carries any model (section 2).
+- **The `cost.ts` price table.** It is not used at run time (section 3).
+
+## 9. The delegation smoke test (Phase 3)
+
+`scripts/smoke-delegation.sh` is the check to run before any orchestration
+run. It decides from opencode's own records, never from what a model
+prints. For each distinct `team/*` seat model (or the one model named with
+`--model`):
+
+- **A.** It answers as the primary agent.
+- **B.** It calls tools; the check is a file appearing on disk.
+- **C.** It answers as a subagent through the task tool. That is a recorded
+  child-session call on the expected model. A provider rejection is
+  reported with its HTTP status and response body. Reasoning is compared
+  with A.
+
+Then, once:
+
+- **D.** One `/teamwork` round trip through the engine, checked against the
+  hash-chained event log. Usage must be metered into the run, every call
+  must be on a configured seat model, and `--budget` must reach the engine.
+
+Exit codes: 0 means every check passed, 1 means a check failed, 2 means it
+could not run. Results with real opencode 1.18.32 and the fake provider:
+
+| Case | Result |
 |---|---|
-| Worktrees created under `.opencode/teamwork/<id>/` | PASS — `…/phase4/worktrees/agent-builder-fix`, branch `teamwork/agent-builder-fix-phase4`, registered with git |
-| Worktrees cleaned up | PASS — removed from disk and pruned from `git worktree list` |
-| A low `--budget` stops dispatch | PASS — at 120% of a $0.05 cap `dispatchable()` returned `[]` and `budget.exhausted` was logged. At 80% it did **not** stop, confirming §3 |
-| Verifier PASS means a command exited 0 | PASS — three ways, below |
-| `state.json` lets a killed run resume | PASS — resumed COMPLETED task and cost from the log; hash chain verified over 6 events; a tampered log was refused |
-| `costs.json` accumulates real numbers | **FAIL — `costs.json` is never written.** Run dir held `state.json`, `events.jsonl`, `plan.dag.json`, `worktrees` |
-| The budget cap fires when the model omits `costUsd` | **FAIL — 25 rounds against a $0.01 cap, cost stayed $0.00, dispatch never stopped** |
+| cooperative single model; two-model team | exit 0, A–D pass for every model |
+| subagent rejected with HTTP 400 | exit 1, C shows the status and body |
+| parent reads the file itself instead of delegating | exit 1, C: task tool never used |
+| no teamwork plugin in the config | exit 2 |
+| npm 0.2.1 build loaded instead | exit 2, names the fix |
+| an unrelated plugin inside this checkout's `node_modules` | exit 2 |
+| provider never answers | exit 2 after `--timeout`, no processes left |
+| no GNU `timeout` (macOS): perl fallback | exit 0 on the two-model run; timeouts, exit codes and signals match GNU `timeout` |
+| `--model` with an id the catalog lacks | exit 2 |
 
-The PASS-requires-evidence guarantee is the strongest thing in this codebase and
-it holds under adversarial input:
+Two `opencode run` traps, both now handled:
 
-- a rubric-only PASS ("looks correct to me") was rejected;
-- a PASS whose executed check recorded `exitCode: 1` was rejected;
-- a PASS was accepted only after the off-by-one was genuinely fixed and `bun
-  test` actually exited 0, with the stdout hash recorded.
+- **Open stdin hangs it.** `opencode run` waits for a piped stdin to close,
+  so an open stdin hangs it forever. Every call passes `</dev/null`.
+- **A leading `--budget` is taken by opencode.** opencode parses it as its
+  own option, so flags go after the message text.
 
-A model cannot talk its way past the verifier. That part of the README is true.
+## 10. Verification on a throwaway repo (Phase 4)
 
-## 11. Phase 4b — is cost tracking measuring anything real?
+**Engine level**, against a scratch repo with a real off-by-one bug and a
+failing test:
 
-**No. And the reason is worse than the subscription question.**
+| Claim | Upstream | Now |
+|---|---|---|
+| Worktrees created under `.opencode/teamwork/<run>/` and cleaned up | PASS, but runs could share or delete each other's branches | PASS (`fix/worktree-branch-collision`) |
+| A low `--budget` stops dispatch | PASS at 100%, not at 80% | same, against metered cost |
+| The cap fires when the model reports no cost | **FAIL**: cost stayed $0.00 | PASS |
+| `costs.json` holds real numbers | **FAIL**: never written | PASS, metered |
+| Verifier PASS requires a command that exited 0 | PASS | PASS |
+| `state.json` lets a killed run resume; tampering is refused | PASS | PASS, and a truncated log is reported instead of thrown |
+| A dead-lettered task does not wedge its dependents | **FAIL**: they stayed PENDING forever | PASS (`fix/cascade-dependency-failure`) |
 
-The brief asked whether the numbers come from a per-token price table or from
-provider-reported usage. **Neither.** As established in §3, the only cost input
-is the `costUsd` argument the orchestrating model passes to `teamwork_verify`.
-It is optional, it defaults to zero, and nothing cross-checks it. The price
-table in `cost.ts` that *would* have made it a per-token estimate is orphaned
-and never runs.
+A PASS needs evidence, and that holds under adversarial input:
 
-So the `--budget` guardrail is arithmetic over a model's self-report. That is
-true on pay-as-you-go and on a Token Plan subscription alike; the billing
-question changes how wrong the number is, not whether it is a measurement.
+- a rubric-only PASS was rejected;
+- a PASS whose executed check exited 1 was rejected;
+- a PASS was accepted only once the bug was really fixed and `bun test`
+  really exited 0.
 
-**Which plan the key is on could not be determined** — there is no key, no
-config and no opencode install on this machine (§7.2). Pay-as-you-go and the
-Token Plan use different keys and different base URLs, so reading
-`provider.xiaomi.options.baseURL` and comparing it against Xiaomi's published
-endpoints will answer it in one look.
+**opencode level**, with real opencode 1.18.32, this build, and the fake
+provider:
 
-**Both remedies were implemented**, because either alone would have been
-misleading:
+- The plugin loads.
+- `/teamwork` plans, dispatches, verifies and completes, with `usage.jsonl`
+  and `costs.json` written.
+- A subagent's HTTP 400 is recorded with its body.
+- In a two-model run, the sentinel ran on the strong model and a delegated
+  verifier ran on the fast one. The status report said every seat ran on its
+  configured model, and it split spend by model.
 
-1. **Surfaced as an estimate.** Run output no longer prints a bare dollar
-   figure. `teamwork_status` and every status line now read
-   `est. cost~$0.00/$3.00 (0%) [self-reported, not metered]`, and
-   `teamwork_plan` states in full that the figure sums the values the sentinel
-   itself reports. The `teamwork_plan` tool description says the same thing to
-   the model.
-2. **`--no-budget` disables enforcement outright.** `/teamwork --no-budget …`
-   parses in code, is recorded in `session.start`, and survives resume so a
-   restarted run does not silently re-arm the cap. `dispatchable()` stops
-   consulting the budget and no `budget.exhausted` event is emitted. Enforcement
-   remains the default.
+**Not yet done:** a run against the real Xiaomi and DeepSeek endpoints.
 
-Also corrected while in there: `teamwork_plan` used to print
-`budget: $20.00 (halt at 80%)`, which states the behaviour the feature table
-gets wrong. It now says it warns at 80% and refuses dispatch at 100%.
+## 11. Upstream fixes, split out for separate PRs
 
-## 8b. Upstream-friendly fixes, split out for separate PRs
-
-Eight defects found during this audit are ordinary upstream bugs with nothing
-to do with a single-model baseline. Each sits on its own branch cut from
-`main`, one commit, tests included, `bun run verify` green, so they can go
-upstream independently of the experiment work.
+Seventeen defects are ordinary upstream bugs, unrelated to the single-model
+work. Each sits on its own branch: one commit off `main`, with tests that
+fail on the unfixed code, and `bun run verify` green. The branches do not
+conflict with each other, and all are merged into this branch.
 
 | Branch | Defect |
 |---|---|
-| `fix/worktree-branch-collision` | `agentBranch` used `sessionId.slice(0, 8)`, which for minted ISO-timestamp ids is the year and month. Two runs in a month that share an agent name collide on one branch: the second gets no worktree and its worker edits the main checkout. `cleanupSession` globbed the same prefix and force-deleted other runs' branches. |
-| `fix/guard-task-permission` | All eight leaf roles declare `permission.task: deny`, and the README promises "a worker cannot fan out its own swarm". The runtime guard only ever enforced `permission.edit`, so that promise had no second line behind it. |
-| `fix/event-log-partial-write` | A partial final line in `events.jsonl` made every reader throw, including `teamwork_resume`, whose job is to report a damaged log. `Engine.resume` also parsed `plan.dag.json` with no catch. |
-| `fix/event-log-stale-tip-cache` | The cached log tip was never invalidated and outranked the file, so an externally changed log led `appendEvent` to write a duplicate `seq` and a stale `prevHash`, breaking the chain. |
-| `fix/policy-parse-silent-fallback` | `loadPolicy` swallowed parse errors, silently reverting to the default ladders and dropping declared `requiredChecks`, including `adversarial:privilege-escalation` on the auth-change route. |
-| `fix/cli-preset-menu` | Two off-by-ones left both `custom` and `skip` unpickable. The out-of-range message named the very number it had just refused. |
-| `fix/cost-artifacts-never-written` | Agent prompts require `cost.json`, describe `costs.json` and `verify/summary.json` that no run writes, and tell the sentinel to own `state.json`, which `src/state.ts` says must never be model-authored. Also fixes `estimateCost` pricing unknown models off Claude Sonnet's card. |
-| `fix/budget-halt-message` | `teamwork_plan` told the sentinel "budget: $X (halt at 80%)". Nothing halts at 80%. |
+| `fix/plugin-entry-exports` | **The plugin never loaded.** opencode calls every function export and rejects the module on anything else ("Plugin export is not a function"). The entry exported a string and an object. |
+| `fix/no-default-model-injection` | Every unconfigured agent was forced onto `anthropic/claude-sonnet-4-5`. |
+| `fix/installer-pin-plugin-version` | The installer wrote `@latest`, which resolves to 0.2.1. That release lacks the engine. |
+| `fix/installer-preserves-user-config` | Install and uninstall destroyed unrelated keys: providers, MCP servers. |
+| `fix/installer-jsonc-strings` | Comment stripping corrupted strings containing `//` or `/*`, and wrote them back. |
+| `fix/cli-preset-menu` | `custom` and `skip` could not be picked, so `--preset custom` failed. |
+| `fix/command-args-cli-quoting` | From the opencode CLI, the quotes opencode adds around the message broke flag parsing; `--budget` became NaN and was dropped. |
+| `fix/plan-honours-parsed-flags` | Flags parsed in code reached the engine only if the model copied them over. |
+| `fix/topology-budget-defaults` | Per-topology default budgets were never applied; every run got $20. |
+| `fix/budget-halt-message` | The sentinel was told "halt at 80%", which never happens. |
+| `fix/cost-artifacts-never-written` | Prompts required cost files no run wrote. `estimateCost` priced unknown models as Claude Sonnet. |
+| `fix/cascade-dependency-failure` | A dead-lettered task left its dependents PENDING forever. |
+| `fix/guard-task-permission` | `permission.task: deny` was declared but never enforced by the guard. |
+| `fix/event-log-partial-write` | A truncated log made every reader throw, including `teamwork_resume`. |
+| `fix/event-log-stale-tip-cache` | A stale cached log tip led to duplicate `seq` values and a broken hash chain. |
+| `fix/policy-parse-silent-fallback` | A malformed `policy.json` silently reverted to defaults, dropping required checks. |
+| `fix/worktree-branch-collision` | Branch names used the year and month as the run id, so one run's cleanup could delete another run's branches. |
 
-Three of these overlap this fork's own edits and will need attention when the
-fork rebases: `fix/event-log-partial-write` and `fix/policy-parse-silent-fallback`
-and `fix/budget-halt-message` all touch `src/tools.ts`, and the last also
-touches the budget messaging this fork rewrote in §11. `fix/cli-preset-menu`
-touches `src/cli/index.ts` near the `--all-seats` wiring. Taking the upstream
-versions first and re-applying §9's list on top is the cleaner order.
+## 12. What this fork adds on top
 
-## 12. Two-model teams: MiMo Pro plus DeepSeek V4.1 Flash
+Files the fork adds, which keeps it rebaseable:
 
-`opencode-teamwork install --strong <id> --fast <id>` assigns each seat from
-`SEAT_TIERS` in `src/cli/all-seats.ts`; `--seat <role>=<model>` overrides any
-seat, in any mode. opencode 1.18.32's bundled catalog lists DeepSeek V4.1
-Flash as `deepseek/deepseek-flash` (the id does not say 4.1), OpenAI protocol
-at `api.deepseek.com`, $0.15 in / $0.60 out per 1M tokens. MiMo V2.6 Pro is
-$0.435 / $0.87. Confirm both with `opencode models <provider> --verbose`.
+| File | Purpose |
+|---|---|
+| `src/cli/all-seats.ts` | `--all-seats`, the `mimo` alias, two-model tiers, `--seat`, catalog lookups, the purity check |
+| `src/cli/plugin-spec.ts` | `--plugin`, and recognising this plugin's entries |
+| `src/single-model.ts` | ladder pinning for `TEAMWORK_ALL_SEATS_MODEL` |
+| `src/seat-models.ts` | each seat's configured model, as the plugin saw it |
+| `src/telemetry.ts` | the usage observer, `usage.jsonl`, `costs.json`, seat checks |
+| `src/repair.ts` | the bounded repair loop |
+| `scripts/smoke-delegation.sh` | Phase 3 |
+| `scripts/fake-model-server.ts` | the scriptable provider used to verify against real opencode |
+| `docs/GROUND-TRUTH.md` | this file |
 
-The gap is small: about 2.9x on input and 1.5x on output. A seat that writes
-or judges code costs more in one extra round than Flash saves, so Flash takes
-only the verifier (the engine refuses a PASS without real exit codes), the
-scout (input-heavy reading) and the proposer (filtered by a strong falsifier
-and synthesizer). The worker stays on Pro; whether Flash workers pay off is
-an empirical question, answerable per run from `costs.json` and the rounds
-per task: run the same tasks with `--seat worker=deepseek/deepseek-flash`.
+Surgical edits to shared code, to re-apply after an upstream merge:
 
-opencode's task tool takes no model, so a subagent always runs on its agent's
-configured model and per-call escalation is not possible through it. The
-routing policy's ladder was always advisory; with seat models known, dispatch
-now names the worker seat's configured model instead, and `teamwork_status`
-flags any seat that ran on a model other than its configured one.
+| File | Edit |
+|---|---|
+| `src/cli/index.ts` | parse `--all-seats`, `--strong/--fast`, `--seat`, `--plugin`; register `mimo`; print the per-seat report |
+| `src/flags.ts` | parse `--no-budget`. This file comes from `fix/plugin-entry-exports`, which moved flag parsing out of the entry module. |
+| `src/index.ts` | carry `--no-budget` onto the run pointer; record seat models in the config hook; wire the usage observer into the event hook |
+| `src/engine.ts` | `budgetEnforced`; `meteredCostUsd` and `effectiveCost`; `failTask` for exhausted repairs |
+| `src/events.ts` | the `artifact.rejected` event type |
+| `src/tools.ts` | repair routing in `teamwork_verify`; the single-model pin in `loadPolicy`; the status line naming its cost source; usage report; dispatch naming the worker seat's model |
 
-## 9. What changed in this fork
+## 13. Known limits and open questions
 
-Additive files, to keep the fork rebaseable:
-
-- `src/cli/all-seats.ts` — `--all-seats` construction, the `mimo` config
-  resolver, and the vendor-string detector used by the test.
-- `src/repair.ts` — bounded re-prompt for boundary 1/2.
-- `scripts/smoke-delegation.sh` — Phase 3.
-- `test/all-seats.test.ts`, `test/repair.test.ts`.
-- `docs/GROUND-TRUTH.md` — this file.
-
-Surgical edits to shared code, listed for re-application after an upstream merge:
-
-| File | Edit | Why |
-|---|---|---|
-| `src/cli/index.ts` | parse `--all-seats` / `--no-budget`; register the `mimo` preset; extend `--help` | Phase 1 entry point |
-| `src/tools.ts` | `teamwork_verify` routes boundary 1/2 through `repairArtifact`; `loadPolicy` honours `TEAMWORK_ALL_SEATS_MODEL` | Phase 2, and section 8 item 1 |
-| `src/engine.ts` | `budgetEnforced` flag so `--no-budget` disables the cap | Phase 4b |
-| `src/index.ts` | parse `--no-budget`; carry it on the run pointer | Phase 4b |
-| `src/tools.ts` | `budgetEnforced` arg on `teamwork_plan`; cost labelled as a self-reported estimate | Phase 4b |
+- **Not yet run against real providers** (section 10). Run
+  `scripts/smoke-delegation.sh` first. Check C is the one that catches the
+  known failure: a model that works as the primary agent but returns HTTP 400
+  as a subagent.
+- **No model choice per delegation.** The task tool cannot pick a model
+  (section 7). Real escalation would need a driver that calls `opencode
+  serve` through `@opencode-ai/sdk`, where each prompt can name its model.
+  That would be a new entry point, not a change here.
+- **The sentinel follows a prompt.** Dispatch is only as reliable as the
+  sentinel's adherence to it. The engine bounds the damage: evidence-gated
+  PASS, a metered budget, the repair bound, and a dead-letter cascade. It
+  cannot make the model call the next tool.
+- **Temperatures differ per role** (section 6.3). Left as upstream designed
+  them.

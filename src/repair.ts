@@ -2,7 +2,7 @@
  * Bounded repair for the model-authored artifact boundary.
  *
  * `verification_report.json` is the only free-form model JSON this plugin
- * reads (see docs/GROUND-TRUTH.md §6): the verifier writes it to disk, the
+ * reads (see docs/GROUND-TRUTH.md §5): the verifier writes it to disk, the
  * sentinel hands over the path, and `teamwork_verify` does `JSON.parse` +
  * Zod. A model that cannot be schema-constrained — MiMo supports JSON mode
  * but not native `json_schema` — has to hit that shape by prompting alone,

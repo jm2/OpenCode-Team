@@ -34,7 +34,6 @@ import {
   findVendorModelStrings,
   protocolFor,
   resolveAlias,
-  singleModelRouting,
   SINGLE_MODEL_ALIASES,
   TEAM_ROLES,
   type ResolvedProviderModel,
