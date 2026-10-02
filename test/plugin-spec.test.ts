@@ -74,6 +74,24 @@ describe("isTeamworkEntry", () => {
     expect(isTeamworkEntry(pathToFileURL(join(mine, "dist", "index.js")).href)).toBe(true);
     expect(isTeamworkEntry(pathToFileURL(join(other, "dist", "index.js")).href)).toBe(false);
   });
+
+  test("a different plugin inside a checkout of this one is not this one", () => {
+    const mine = fakeCheckout();
+    const nested = join(mine, "node_modules", "some-other-plugin");
+    mkdirSync(join(nested, "dist"), { recursive: true });
+    writeFileSync(join(nested, "package.json"), JSON.stringify({ name: "some-other-plugin" }));
+    const entry = pathToFileURL(join(nested, "dist", "index.js")).href;
+    expect(isTeamworkEntry(entry)).toBe(false);
+
+    // and the installer keeps its entry
+    const cfg = join(mkdtempSync(join(tmpdir(), "cfg-")), "opencode.json");
+    writeFileSync(cfg, JSON.stringify({ plugin: [entry] }));
+    run(["install", "--preset", "google", "--yes", "--plugin", mine, "--config", cfg]);
+    expect(JSON.parse(readFileSync(cfg, "utf-8")).plugin).toEqual([
+      entry,
+      pathToFileURL(join(mine, "dist", "index.js")).href,
+    ]);
+  });
 });
 
 describe("the installer with --plugin", () => {

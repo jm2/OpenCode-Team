@@ -14,16 +14,22 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const PACKAGE_NAME = "opencode-teamwork";
 
-/** Nearest package.json at or above `start` whose name is this package. */
+/**
+ * The root of the package that owns `start`, if that package is this one.
+ *
+ * Only the nearest package.json counts. Walking past it would claim any
+ * plugin that sits inside a checkout of this one, such as a dependency under
+ * its node_modules, and the installer would then drop that plugin's entry.
+ */
 export function findPackageRoot(start: string, depth = 8): string | null {
   let dir = start;
   for (let i = 0; i < depth; i += 1) {
     const pj = join(dir, "package.json");
     if (existsSync(pj)) {
       try {
-        if (JSON.parse(readFileSync(pj, "utf-8")).name === PACKAGE_NAME) return dir;
+        return JSON.parse(readFileSync(pj, "utf-8")).name === PACKAGE_NAME ? dir : null;
       } catch {
-        // unreadable package.json: keep walking
+        return null;
       }
     }
     const up = dirname(dir);

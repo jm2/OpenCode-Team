@@ -21,6 +21,8 @@
 #
 # Requires this fork's plugin to be the one opencode loads:
 #   opencode-teamwork install --all-seats <provider/model> --plugin local
+#   opencode-teamwork install --strong <model> --fast <model> --plugin local
+# Every distinct team/* seat model gets checks A to C; --model checks one.
 # The checks spend a few small requests against your provider and create a
 # few sessions in your opencode history.
 #
@@ -57,7 +59,7 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT="${2:-}"; shift 2 ;;
     --skip-dispatch) SKIP_DISPATCH=1; shift ;;
     --keep) KEEP=1; shift ;;
-    -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) die_setup "unknown argument: $1" ;;
   esac
 done
@@ -119,11 +121,13 @@ if (cmd === "config") {
     if (p === "opencode-teamwork" || p.startsWith("opencode-teamwork@")) return true;
     if (!p.startsWith("file://")) return false;
     let d = dirname(fileURLToPath(p));
-    for (let i = 0; i < 8; i++) { const pj = join(d, "package.json"); if (existsSync(pj)) { try { if (JSON.parse(readFileSync(pj, "utf8")).name === "opencode-teamwork") return true; } catch {} } const up = dirname(d); if (up === d) break; d = up; }
+    // Only the nearest package.json owns the file: a plugin under this
+    // checkout's node_modules is not this plugin.
+    for (let i = 0; i < 8; i++) { const pj = join(d, "package.json"); if (existsSync(pj)) { try { return JSON.parse(readFileSync(pj, "utf8")).name === "opencode-teamwork"; } catch { return false; } } const up = dirname(d); if (up === d) break; d = up; }
     return false;
   };
   const plugins = (Array.isArray(cfg.plugin) ? cfg.plugin : []).filter(isTeamwork);
-  console.log(["OK", path, model, plugins.join(" ") || "-", seats.length > 0 ? "seats" : "default"].join("\t"));
+  console.log(["OK", path, model, plugins.join(" ") || "-", wantModel ? "explicit" : seats.length > 0 ? "seats" : "default"].join("\t"));
 } else if (cmd === "describe") {
   // stdin: `opencode models <provider> --verbose`; a: [model]
   const text = readFileSync(0, "utf8").split(/\r?\n/);
@@ -174,32 +178,51 @@ EOF
 [ "$STATUS" = "OK" ] || die_setup "$CFG_PATH_OR_ERR"
 MODELS="$(printf '%s' "$RESOLVED_MODEL" | tr ',' ' ')"
 ok "config: $CFG_PATH_OR_ERR"
-ok "models: $MODELS$([ "$SEATS" = seats ] && printf ' (the team/* seats)' || printf ' (no team/* seats set: the default model)')"
+case "$SEATS" in
+  seats) ok "models: $MODELS (the team/* seats)" ;;
+  explicit) ok "model: $MODELS (--model)" ;;
+  *) ok "model: $MODELS (no team/* seats set: the default model)" ;;
+esac
 
 case "$PLUGINS" in
   -) die_setup "opencode-teamwork is not in the config's plugin list. Install it:
-     opencode-teamwork install --all-seats <provider/model> --plugin local" ;;
+     opencode-teamwork install --all-seats <provider/model> --plugin local
+     opencode-teamwork install --strong <model> --fast <model> --plugin local" ;;
   file://*) ok "plugin: $PLUGINS" ;;
   *) warn "plugin: $PLUGINS from npm. No npm release has this fork's metering, so checks"
      info "C and D will fail on missing telemetry. Use --plugin local when installing." ;;
 esac
 
 # Portable timeout: GNU timeout, Homebrew gtimeout, or perl (always on macOS).
+# The perl fallback matches GNU timeout where it matters here: the command
+# gets its own process group, which is signalled whole (opencode starts
+# helper processes), 124 means it timed out, and a command killed by a signal
+# reports 128 + the signal rather than 0.
 with_timeout() {
   local secs="$1"; shift
   if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
-  else perl -e 'my $s = shift @ARGV; my $pid = fork(); if (!$pid) { exec @ARGV; exit 127 }
-                $SIG{ALRM} = sub { kill "TERM", $pid; exit 124 }; alarm $s;
-                waitpid($pid, 0); exit($? >> 8)' "$secs" "$@"
+  else perl -MPOSIX=:sys_wait_h -e '
+      my $s = shift @ARGV; my $pid = fork() // exit 125;
+      if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; exit 127 }
+      $SIG{ALRM} = sub { kill "TERM", -$pid;
+        for (1 .. 20) { last if waitpid($pid, WNOHANG) > 0; select(undef, undef, undef, 0.1) }
+        kill "KILL", -$pid; exit 124 };
+      alarm $s; waitpid($pid, 0);
+      exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$secs" "$@"
   fi
 }
 
+# Resolve once per model in preflight; each model's checks reload it.
+desc_file() { printf '%s/describe-%s' "$WORKDIR" "$(printf '%s' "$1" | tr '/:.' '___')"; }
+load_model() {
+  IFS=$'\t' read -r D_STATUS PROTOCOL NPM URL BILLING REASONING INTERLEAVED < "$(desc_file "$1")"
+}
 describe_model() {
   local model="$1" provider="${1%%/*}"
-  IFS=$'\t' read -r D_STATUS PROTOCOL NPM URL BILLING REASONING INTERLEAVED <<EOF
-$(with_timeout 120 opencode models "$provider" --verbose </dev/null 2>/dev/null | "$RUNTIME" "$HELPER" describe "$model")
-EOF
+  with_timeout 120 opencode models "$provider" --verbose </dev/null 2>/dev/null \
+    | "$RUNTIME" "$HELPER" describe "$model" > "$(desc_file "$model")" || true
+  load_model "$model"
   [ "$D_STATUS" = "OK" ] || die_setup "opencode does not list $model (check: opencode models $provider). Credentials missing, or a typo in the id."
   if [ "$PROTOCOL" = "unknown" ]; then warn "$model protocol: UNKNOWN (npm package: $NPM)"; else ok "$model: $PROTOCOL protocol ($NPM)"; fi
   info "endpoint: $URL$([ "$BILLING" != unknown ] && printf '  [%s]' "$BILLING")"
@@ -235,7 +258,7 @@ SCRATCH="$WORKDIR/scratch"; mkdir -p "$SCRATCH"
 
 for MODEL in $MODELS; do
   TAG="$(printf '%s' "$MODEL" | tr '/:.' '___')"
-  describe_model "$MODEL" >/dev/null
+  load_model "$MODEL"
   # ─── A. primary ──────────────────────────────────────────────────────
 
   head_ "A. Does $MODEL answer as the PRIMARY agent?"
@@ -322,7 +345,8 @@ EOF
     else ok "plan, dispatch, verify, completed: all in the hash-chained log"; fi
     if [ "$USAGE" -gt 0 ]; then ok "$USAGE model calls metered into the run"
     else fail "nothing was metered into the run: the budget would fall back to self-reported cost"; fi
-    if [ -n "$RUN_MODELS" ] && [ "$(printf '%s' "$RUN_MODELS" | tr ',' '\n' | while read -r rm; do case " $MODELS " in *" $rm "*) ;; *) echo "$rm" ;; esac; done | head -1)" != "" ]; then
+    STRAY="$(printf '%s' "$RUN_MODELS" | tr ',' '\n' | while read -r rm; do case " $MODELS " in *" $rm "*) ;; *) echo "$rm" ;; esac; done | head -1)"
+    if [ -n "$STRAY" ]; then
       fail "the run used $RUN_MODELS, which includes a model no seat is configured for ($MODELS)"
     elif [ -n "$RUN_MODELS" ]; then ok "every model call in the run was on a configured seat model ($RUN_MODELS)"; fi
     [ "$BUDGET" = "1" ] && ok "--budget 1 reached the engine" || fail "--budget 1 did not reach the engine (it started at $BUDGET)"
